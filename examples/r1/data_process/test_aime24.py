@@ -47,7 +47,7 @@ if __name__ == '__main__':
             question = example.pop('problem')
 
             question = question + ' ' + instruction_following
-            solution = example.pop('ground_truth_answer')
+            solution = example.pop('answer')
             data = {
                 "data_source": data_source,
                 "prompt": [

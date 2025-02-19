@@ -44,7 +44,7 @@ if __name__ == '__main__':
     def make_map_fn(split):
 
         def process_fn(example, idx):
-            question = example.pop('problem')
+            question = example.pop('question')
 
             question = question + ' ' + instruction_following
             solution = example.pop('ground_truth_answer')
