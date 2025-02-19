@@ -30,6 +30,9 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
     elif data_source in ['codecontests', 'apps', 'codeforces', 'taco']:
         from . import prime_code
         res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+    elif data_source in ['pe-nlp/math-level3to5-Filtered', 'HuggingFaceH4/aime_2024']:
+        from . import r1
+        res = r1.compute_score(solution_str, ground_truth)
     else:
         raise NotImplementedError
 
