@@ -34,7 +34,8 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
         from . import r1
         res = r1.compute_score(solution_str, ground_truth)
     else:
-        raise NotImplementedError
+        from . import r1
+        res = r1.compute_score(solution_str, ground_truth)
 
     if isinstance(res, (int, float, bool)):
         return float(res)
