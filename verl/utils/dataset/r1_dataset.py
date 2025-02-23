@@ -39,6 +39,17 @@ class R1Dataset(RLHFDataset):
 
         print(f'filter dataset len: {len(self.dataframe)}')
 
+    def resume_dataset_state(self, start_idx=0):
+        self.serialize_dataset = False if hasattr(self, 'original_parquet_files') else True
+        # resume dataframe if not it's serialized in data.pt
+        if not self.serialize_dataset:
+            self._download(use_origin_parquet=True)  # download and resume from original parquet files
+            self._read_files_and_tokenize()
+        else:
+            print(r'old dataloader ckpt file is used, please train from scratch for better ckpt performance')
+        start_idx = start_idx % len(self.dataframe)
+        self.dataframe = self.dataframe.iloc[start_idx:]
+
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
