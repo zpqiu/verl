@@ -788,10 +788,8 @@ class RayPPOTrainer(object):
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
         self.train_dataloader = torch.load(dataloader_local_path)
-        print("[[SamplerIndex]] ", self.train_dataloader.sampler._index)
         if isinstance(self.train_dataloader.dataset, RLHFDataset) or isinstance(self.train_dataloader.dataset, R1Dataset):
             self.train_dataloader.dataset.resume_dataset_state()
-        print("[[SamplerIndex]] ", self.train_dataloader.sampler._index)
 
          # 根据 global_step 计算应该恢复的索引位置
         batch_size = self.config.data.train_batch_size
@@ -802,11 +800,11 @@ class RayPPOTrainer(object):
         start_idx = samples_processed % dataset_size
 
         print("[[StartIndex]] ", start_idx)
-        if self.train_dataloader.sampler._index != start_idx:
-            if isinstance(self.train_dataloader.dataset, R1Dataset):
-                new_sampler = torch.utils.data.SequentialSampler(self.train_dataloader.dataset)
-                new_sampler._index = start_idx
-                self.train_dataloader.sampler = new_sampler
+        if isinstance(self.train_dataloader.sampler, torch.utils.data.SequentialSampler) and \
+              isinstance(self.train_dataloader.dataset, R1Dataset):
+            batches_to_skip = start_idx // batch_size
+            for _ in range(batches_to_skip):
+                next(iter(self.train_dataloader))
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
