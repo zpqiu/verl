@@ -788,7 +788,7 @@ class RayPPOTrainer(object):
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
         self.train_dataloader = torch.load(dataloader_local_path)
-        if isinstance(self.train_dataloader.dataset, RLHFDataset):
+        if isinstance(self.train_dataloader.dataset, RLHFDataset) or isinstance(self.train_dataloader.dataset, R1Dataset):
             self.train_dataloader.dataset.resume_dataset_state()
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
