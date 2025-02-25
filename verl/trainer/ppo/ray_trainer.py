@@ -761,7 +761,8 @@ class RayPPOTrainer(object):
 
         # save dataloader
         dataloader_local_path = os.path.join(local_global_step_folder, 'data.pt')
-        self.train_dataloader.save_state(dataloader_local_path)
+        dataloader_state_dict = self.train_dataloader.state_dict()
+        torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
@@ -817,7 +818,8 @@ class RayPPOTrainer(object):
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
         if os.path.exists(dataloader_local_path):
-            self.train_dataloader.load_state(dataloader_local_path)
+            dataloader_state_dict = torch.load(dataloader_local_path)
+            self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
