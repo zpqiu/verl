@@ -48,7 +48,9 @@ class R1Dataset(RLHFDataset):
         else:
             print(r'old dataloader ckpt file is used, please train from scratch for better ckpt performance')
         start_idx = start_idx % len(self.dataframe)
-        self.dataframe = self.dataframe.iloc[start_idx:]
+        df = self.dataframe
+        df = pd.concat([df[start_idx:], df[:start_idx]], axis=0).reset_index(drop=True)
+        self.dataframe = df
 
     def __getitem__(self, item):
         """

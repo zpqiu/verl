@@ -22,11 +22,6 @@ from verl.utils.hdfs_io import copy, makedirs
 import argparse
 
 
-OPEN_R1_SYS = ("You are a helpful AI Assistant that provides well-reasoned and detailed responses. "
-               "You first think about the reasoning process as an internal monologue and then provide the user with the answer. "
-               "Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>")
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_dir', default='~/data/deepscaler')
@@ -34,27 +29,21 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    data_source = 'pe-nlp/DeepScaleR-40k-Prompt-Filtered'
+    data_source = 'pe-nlp/math-cl'
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
     train_dataset = datasets.load_dataset(data_source, split='train', trust_remote_code=True)
 
-    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+    # instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
 
         def process_fn(example, idx):
             question = example.pop('problem')
-
-            question = question + ' ' + instruction_following
             solution = example.pop('ground_truth_answer')
             data = {
                 "data_source": data_source,
                 "prompt": [
-                    {
-                        "role": "system",
-                        "content": OPEN_R1_SYS
-                    },
                     {
                         "role": "user",
                         "content": question

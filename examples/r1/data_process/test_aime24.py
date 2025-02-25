@@ -46,15 +46,15 @@ if __name__ == '__main__':
         def process_fn(example, idx):
             question = example.pop('problem')
 
-            question = question + ' ' + instruction_following
+            question = question# + ' ' + instruction_following
             solution = example.pop('answer')
             data = {
                 "data_source": data_source,
                 "prompt": [
-                    {
-                        "role": "system",
-                        "content": OPEN_R1_SYS
-                    },
+                    # {
+                    #     "role": "system",
+                    #     "content": OPEN_R1_SYS
+                    # },
                     {
                         "role": "user",
                         "content": question

@@ -1,9 +1,7 @@
 import torch
 import re
 import random
-from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, ExprExtractionConfig, parse, verify
-from sympy import zoo, nan
+from symeval import EvaluatorMathBatch
 
 def last_boxed_only_string(string):
     idx = string.rfind("\\boxed")
@@ -48,66 +46,16 @@ def calculate_accuracy_reward(completion, solution):
     if last_boxed_str[7:-1].strip() == solution.strip():
         return 1.0
 
-    def _is_valid(parsed_result):
-        if parsed_result is None:
-            return False
-        if len(parsed_result) == 0:
-            return False
-        if parsed_result[0] is zoo or parsed_result[0] is nan or parsed_result[1] is zoo or parsed_result[1] is nan:
-            return False
-        return True
-
-    gold_parsed = parse(f"\\boxed{{{solution}}}", extraction_mode="first_match", extraction_config=[
-                LatexExtractionConfig(
-                    normalization_config=NormalizationConfig(
-                        nits=False,
-                        malformed_operators=False,
-                        basic_latex=True,
-                        equations=True,
-                        boxed=True,
-                        units=True,
-                    ),
-                    # Ensures that boxed is tried first
-                    boxed_match_priority=0,
-                    try_extract_without_anchor=False,
-                ),
-                ExprExtractionConfig(),
-                # StringExtractionConfig()
-            ],)
-    if len(gold_parsed) != 0:
-        # We require the answer to be provided in correct latex (no malformed operators)
-        answer_parsed = parse(
-            last_boxed_str,
-            extraction_config=[
-                LatexExtractionConfig(
-                    normalization_config=NormalizationConfig(
-                        nits=False,
-                        malformed_operators=False,
-                        basic_latex=True,
-                        equations=True,
-                        boxed=True,
-                        units=True,
-                    ),
-                    # Ensures that boxed is tried first
-                    boxed_match_priority=0,
-                    try_extract_without_anchor=False,
-                ),
-                ExprExtractionConfig(),
-                # StringExtractionConfig()
-            ],
-            extraction_mode="first_match",
-        )
-        if _is_valid(answer_parsed) and _is_valid(gold_parsed):
-            # Reward 1 if the content is the same as the ground truth, 0 otherwise
-            if verify(answer_parsed, gold_parsed):
-                return 1.0
-            else:
-                return 0.0
+    # check if the completion is a valid latex expression
+    try:
+        evaluator = EvaluatorMathBatch()
+        if evaluator.eq(solution, last_boxed_str[7:-1]):
+            return 1.0
         else:
-            return 0.0
-    else:
-        # If the gold solution is not parseable, we reward 1 to skip this example
-        return 1.0
+            return -1.0
+    except Exception as e:
+        print(f"Error checking if the completion is a valid latex expression: {e}")
+        return -1.0
 
 
 # case = '<think>123</think><think>123</think><answer>456</answer>'
@@ -158,16 +106,16 @@ def compute_score(solution_str, ground_truth) -> float:
     if random.randint(0, 16) == 1:  
         do_print = True
         
-    if do_print:
-        print(f"Response Case: {response}")
-        print(f"Answer Case: {final_answer} <====> GT: {ground_truth}")
-
     # format_reward = calculate_format_reward(response)
     try:
         accuracy_reward = calculate_accuracy_reward(final_answer, ground_truth)
     except Exception as e:
         print(f"Error calculating accuracy reward: {e}")
         return 0.0
+
+    if do_print:
+        print(f"Response Case: {response}")
+        print(f"[Score: {accuracy_reward}] Answer Case: {final_answer} <====> GT: {ground_truth}")
 
     if accuracy_reward == 1.0:
         return 1.0
