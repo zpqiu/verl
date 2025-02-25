@@ -506,10 +506,10 @@ class RayPPOTrainer(object):
             sampler = SequentialSampler(data_source=self.train_dataset)
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                         batch_size=self.config.data.train_batch_size,
-                                         drop_last=True,
-                                         collate_fn=collate_fn,
-                                         sampler=sampler)
+                                                   batch_size=self.config.data.train_batch_size,
+                                                   drop_last=True,
+                                                   collate_fn=collate_fn,
+                                                   sampler=sampler)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
