@@ -36,7 +36,7 @@ if __name__ == '__main__':
 
     data_source = 'HuggingFaceH4/MATH-500'
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
-    train_dataset = datasets.load_dataset(data_source, split='train', trust_remote_code=True)
+    train_dataset = datasets.load_dataset(data_source, split='test', trust_remote_code=True)
 
     instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
@@ -74,7 +74,7 @@ if __name__ == '__main__':
 
         return process_fn
 
-    train_dataset = train_dataset.sample(n=100, random_state=42).reset_index(drop=True)
+    train_dataset = train_dataset.shuffle(seed=42).select(range(100))
     train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
 
     local_dir = args.local_dir
