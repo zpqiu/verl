@@ -63,7 +63,7 @@ def calculate_accuracy_reward(completion, solution):
                         nits=False,
                         malformed_operators=False,
                         basic_latex=True,
-                        equations=True,
+                        # equations=True,
                         boxed=True,
                         units=True,
                     ),
@@ -84,7 +84,7 @@ def calculate_accuracy_reward(completion, solution):
                         nits=False,
                         malformed_operators=False,
                         basic_latex=True,
-                        equations=True,
+                        # equations=True,
                         boxed=True,
                         units=True,
                     ),
@@ -97,7 +97,7 @@ def calculate_accuracy_reward(completion, solution):
             ],
             extraction_mode="first_match",
         )
-        if _is_valid(answer_parsed) and _is_valid(gold_parsed):
+        if len(answer_parsed) != 0 and _is_valid(answer_parsed) and _is_valid(gold_parsed):
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
             if verify(answer_parsed, gold_parsed):
                 return 1.0
@@ -155,19 +155,19 @@ def compute_score(solution_str, ground_truth) -> float:
     final_answer = extract_answer_part(response)
 
     do_print = False
-    if random.randint(0, 16) == 1:  
+    if random.randint(0, 512) == 1:  
         do_print = True
         
-    if do_print:
-        print(f"Response Case: {response}")
-        print(f"Answer Case: {final_answer} <====> GT: {ground_truth}")
-
     # format_reward = calculate_format_reward(response)
     try:
         accuracy_reward = calculate_accuracy_reward(final_answer, ground_truth)
     except Exception as e:
         print(f"Error calculating accuracy reward: {e}")
         return 0.0
+    
+    if do_print:
+        print(f"Response Case: {response}")
+        print(f"[Reward: {accuracy_reward}] Answer Case: {final_answer} <====> GT: {ground_truth}")
 
     if accuracy_reward == 1.0:
         return 1.0
