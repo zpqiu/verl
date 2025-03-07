@@ -462,6 +462,8 @@ class RayPPOTrainer(object):
 
     def _create_dataloader(self):
         from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+        from verl.trainer.ppo.sampler import CurriculumSampler, DynamicSampler
+
         # TODO: we have to make sure the batch size is divisible by the dp size
         self.train_dataset = R1Dataset(parquet_files=self.config.data.train_files,
                                          tokenizer=self.tokenizer,
@@ -470,13 +472,35 @@ class RayPPOTrainer(object):
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation='error')
-        # use sampler for better ckpt resume
-        if self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(data_source=self.train_dataset)
+        
+        # inject total_training_steps to actor/critic optim_config and curriculum sampler[optional]. This is hacky.
+        total_training_steps = (len(self.train_dataset) // self.config.data.train_batch_size) * self.config.trainer.total_epochs
+
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+
+        self.total_training_steps = total_training_steps
+        print(f'Total training steps: {self.total_training_steps}')
+
+        # # use sampler for better ckpt resume
+        # if self.config.data.shuffle:
+        #     train_dataloader_generator = torch.Generator()
+        #     train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
+        #     sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
+        # else:
+        #     sampler = SequentialSampler(data_source=self.train_dataset)
+        # sampler = CurriculumSampler(data_source=self.train_dataset, 
+        #                             difficulties=self.train_dataset.difficulties, 
+        #                             total_steps=self.total_training_steps, 
+        #                             batch_size=self.config.data.train_batch_size,
+        #                             initial_lambda=-20.0,
+        #                             final_lambda=20.0)
+        
+        sampler = DynamicSampler(data_source=self.train_dataset, 
+                                 difficulties=self.train_dataset.difficulties, 
+                                 total_steps=self.total_training_steps, 
+                                 batch_size=self.config.data.train_batch_size,
+                                 init_level=1)
 
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=self.config.data.train_batch_size,
@@ -502,15 +526,6 @@ class RayPPOTrainer(object):
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
         print(f'Size of val dataloader: {len(self.val_dataloader)}')
-
-        # inject total_training_steps to actor/critic optim_config. This is hacky.
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
-        print(f'Total training steps: {self.total_training_steps}')
 
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
@@ -796,7 +811,9 @@ class RayPPOTrainer(object):
             # 计算在数据集中的实际索引位置
             start_idx = samples_processed
             print("[[StartIndex]] ", start_idx)
-            self.train_dataloader.dataset.resume_dataset_state(start_idx)
+            self.train_dataloader.dataset.resume_dataset_state()
+            # self.train_dataloader.sampler.update_step(self.global_steps)
+            # self.train_dataloader.sampler.set_current_level(5)
         elif isinstance(self.train_dataloader.dataset, RLHFDataset):
             self.train_dataloader.dataset.resume_dataset_state()
 
@@ -854,6 +871,7 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                metrics["difficulty"] = np.mean(batch.non_tensor_batch['difficulty'])
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
@@ -969,6 +987,9 @@ class RayPPOTrainer(object):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+
+                print("[Sampler] ", self.train_dataloader.sampler.current_level)
+                self.train_dataloader.sampler.update_policy(metrics["critic/score/mean"])
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

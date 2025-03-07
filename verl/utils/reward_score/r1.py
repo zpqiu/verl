@@ -97,7 +97,7 @@ def calculate_accuracy_reward(completion, solution):
             ],
             extraction_mode="first_match",
         )
-        if len(answer_parsed) != 0 and _is_valid(answer_parsed) and _is_valid(gold_parsed):
+        if len(answer_parsed) == 2 and len(gold_parsed) == 2 and _is_valid(answer_parsed) and _is_valid(gold_parsed):
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
             if verify(answer_parsed, gold_parsed):
                 return 1.0
@@ -138,6 +138,12 @@ def calculate_format_reward(completion):
 
 def extract_qwen_output(prompt):
     model_output = prompt.split("Assistant: <think>")[-1]
+
+    stop_words = ["</s>", "<|im_end|>", "<|endoftext|>"] 
+    for stop_word in stop_words:
+        if stop_word in model_output:
+            model_output = model_output.split(stop_word)[0].strip()
+    model_output = model_output.strip()
     return model_output
 
 
@@ -157,6 +163,11 @@ def compute_score(solution_str, ground_truth) -> float:
     do_print = False
     if random.randint(0, 512) == 1:  
         do_print = True
+
+    if not is_format_correct("<think>" + response):
+        if do_print:
+            print(f"[Invalid Format] Response Case: {response}")
+        return 0.0
         
     # format_reward = calculate_format_reward(response)
     try:

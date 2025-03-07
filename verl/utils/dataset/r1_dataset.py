@@ -1,4 +1,6 @@
+from typing import List, Union
 import pandas as pd
+from transformers import PreTrainedTokenizer
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
@@ -11,6 +13,21 @@ PROMPT_TEMPLATE = ("A conversation between User and Assistant. The User asks a q
                    "Assistant: <think>")
 
 class R1Dataset(RLHFDataset):
+    def __init__(self,
+                 parquet_files: Union[str, List[str]],
+                 tokenizer: PreTrainedTokenizer,
+                 prompt_key='prompt',
+                 max_prompt_length=1024,
+                 filter_prompts=True,
+                 cache_dir='~/.cache/verl/rlhf',
+                 chat_template_func=None,
+                 return_raw_chat=False,
+                 truncation='error'):
+        super().__init__(parquet_files, tokenizer, prompt_key, max_prompt_length, filter_prompts, cache_dir, chat_template_func, return_raw_chat, truncation)
+        if 'difficulty' in self.dataframe.columns:
+            self.difficulties = self.dataframe['difficulty'].values
+        else:
+            self.difficulties = None
 
     def _wrap_prompt(self, chat):
         for msg in chat:
@@ -82,5 +99,7 @@ class R1Dataset(RLHFDataset):
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
         row_dict["index"] = index
+        difficulty = row_dict.get("difficulty", 0.0)
+        row_dict["difficulty"] = difficulty
 
         return row_dict
