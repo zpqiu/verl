@@ -192,6 +192,7 @@ if __name__ == "__main__":
         seed=42
     )
     data_loader = StatefulDataLoader(dataset, sampler=sampler, batch_size=3, num_workers=0)
+    print(len(data_loader))
     difficulties = train_dataset.to_pandas()['difficulty'].values
     i = 0
     data = []
