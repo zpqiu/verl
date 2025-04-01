@@ -20,12 +20,13 @@ import datasets
 from verl.utils.hdfs_io import copy, makedirs
 import argparse
 
-
-PROMPT_TEMPLATE = ("Solve the following math problem step by step. "
-                    "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
-                    "i.e., <think> reasoning process here </think> <answer> answer here </answer>. \n\n"
-                    "{question}\n\n"
-                    "Remember to put your answer inside <answer> </answer> tags, and your final answer will be extracted automatically by the \\boxed{{}} tag.")
+PROMPT_TEMPLATE = (
+    "Solve the following math problem step by step. "
+    "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
+    "i.e., <think> reasoning process here </think> <answer> answer here </answer>. \n\n"
+    "{question}\n\n"
+    "Remember to put your answer inside <answer> </answer> tags, and your final answer will be extracted automatically by the \\boxed{{}} tag."
+)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -53,12 +54,12 @@ if __name__ == '__main__':
             question = PROMPT_TEMPLATE.format(question=question)
             solution = example.pop('answer')
             data = {
-                "data_source": "lighteval/MATH", # reuse the existing reward function
+                "data_source": "lighteval/MATH",  # reuse the existing reward function
                 "prompt": [{
                     "role": "user",
                     "content": question
                 }],
-                "difficulty": max(min(int((1.0-example.pop('pass_at_n')) * 10) + 1, 10), 1),
+                "difficulty": max(min(int((1.0 - example.pop('pass_at_n')) * 10) + 1, 10), 1),
                 "ability": "math",
                 "reward_model": {
                     "style": "rule",

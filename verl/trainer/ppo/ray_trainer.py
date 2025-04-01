@@ -412,7 +412,8 @@ class RayPPOTrainer(object):
             if self.config.trainer.total_training_steps is not None:
                 total_training_steps = self.config.trainer.total_training_steps
             else:
-                total_training_steps = (len(self.train_dataset) // self.config.data.train_batch_size) * self.config.trainer.total_epochs
+                total_training_steps = (len(self.train_dataset) //
+                                        self.config.data.train_batch_size) * self.config.trainer.total_epochs
             sampler = DynamicSampler(data_source=self.train_dataset,
                                      difficulties=self.train_dataset.difficulties,
                                      total_steps=total_training_steps,
