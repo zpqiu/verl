@@ -65,7 +65,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
-    mean_difficulty = np.mean(batch.non_tensor_batch['difficulty'])
+    if 'difficulty' in batch.non_tensor_batch:
+        mean_difficulty = np.mean(batch.non_tensor_batch['difficulty'])
+    else:
+        mean_difficulty = None
 
     if use_critic:
         values = batch.batch['values']
@@ -129,8 +132,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             torch.min(prompt_length).detach().item(),
         'prompt_length/clip_ratio':
             torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
-        "prompt_difficulty/mean":
-            mean_difficulty,
+
+        **({"prompt_difficulty/mean": mean_difficulty} if mean_difficulty is not None else {}),
     }
     return metrics
 
