@@ -407,21 +407,35 @@ class RayPPOTrainer(object):
             'truncation', 'error'
         ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
         # use sampler for better ckpt resume
-        if self.config.data.shuffle:
+        if self.config.data.get('use_dynamic_sampler', False):
+            print("use dynamic sampler")
+            if self.config.trainer.total_training_steps is not None:
+                total_training_steps = self.config.trainer.total_training_steps
+            else:
+                total_training_steps = (len(self.train_dataset) // self.config.data.train_batch_size) * self.config.trainer.total_epochs
+            sampler = DynamicSampler(data_source=self.train_dataset,
+                                     difficulties=self.train_dataset.difficulties,
+                                     total_steps=total_training_steps,
+                                     batch_size=self.config.data.train_batch_size,
+                                     init_level=0)
+        elif self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
             train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
-        # TODO: config dynamic sampler
-
+        prefetch_factor = None
+        if self.config.data.get('use_dynamic_sampler', False):
+            # disable prefetch for dynamic sampler
+            prefetch_factor = 0
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.train_batch_size,
                                                    num_workers=8,
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
-                                                   sampler=sampler)
+                                                   sampler=sampler,
+                                                   prefetch_factor=prefetch_factor)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
@@ -454,8 +468,12 @@ class RayPPOTrainer(object):
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
+        if self.config.data.get('use_dynamic_sampler', False):
+            # len(train_dataloader) depends on the len(sampler)
+            # But sampler is dynamic, so we need to set total_training_steps in advance
+            total_training_steps = len(self.train_dataloader)
+        else:
+            total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
@@ -946,8 +964,8 @@ class RayPPOTrainer(object):
                     progress_bar.close()
                     return
 
-                # TODO: update sampler
-                # self.train_dataloader.sampler.update_sampling_policy(metrics["critic/score/mean"])
+                if self.config.data.get('use_dynamic_sampler', False):
+                    self.train_dataloader.sampler.update_sampling_policy(metrics["critic/score/mean"])
 
                 progress_bar.update(1)
                 self.global_steps += 1
