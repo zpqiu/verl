@@ -425,17 +425,16 @@ class RayPPOTrainer(object):
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
-        prefetch_factor = None
+        num_workers = 8
         if self.config.data.get('use_dynamic_sampler', False):
-            # disable prefetch for dynamic sampler
-            prefetch_factor = 0
+            # disable multiprocessing for dynamic sampler
+            num_workers = 0
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.train_batch_size,
-                                                   num_workers=8,
+                                                   num_workers=num_workers,
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
-                                                   sampler=sampler,
-                                                   prefetch_factor=prefetch_factor)
+                                                   sampler=sampler)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
