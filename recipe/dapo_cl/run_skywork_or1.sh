@@ -116,6 +116,8 @@ python3 -m recipe.dapo_cl.src.main_dapo \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
+    custom_reward_function.path=${current_dir}/src/reward_function.py \
+    custom_reward_function.name=compute_score \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
