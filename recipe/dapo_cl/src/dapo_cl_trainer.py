@@ -42,16 +42,10 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     def _create_dataloader(self):
         # TODO: we have to make sure the batch size is divisible by the dp size
-        self.train_dataset = R1Dataset(parquet_files=self.config.data.train_files,
-                                         tokenizer=self.tokenizer,
-                                         processor=self.processor,
-                                         prompt_key=self.config.data.prompt_key,
-                                         image_key=self.config.data.get('image_key', 'images'),
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         filter_prompts=True,
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation=self.config.data.get('truncation', 'error'),
-                                         filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        self.train_dataset = R1Dataset(data_files=self.config.data.train_files,
+                                        tokenizer=self.tokenizer,
+                                        processor=self.processor,
+                                        config=self.config)
         assert self.train_dataset.truncation == self.config.data.get(
             'truncation', 'error'
         ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
@@ -77,16 +71,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
 
-        self.val_dataset = R1Dataset(parquet_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       processor=self.processor,
-                                       prompt_key=self.config.data.prompt_key,
-                                       image_key=self.config.data.get('image_key', 'images'),
-                                       max_prompt_length=self.config.data.max_prompt_length,
-                                       filter_prompts=True,
-                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation=self.config.data.get('truncation', 'error'),
-                                       filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        self.val_dataset = R1Dataset(data_files=self.config.data.val_files,
+                                    tokenizer=self.tokenizer,
+                                    processor=self.processor,
+                                    config=self.config)
         assert self.val_dataset.truncation == self.config.data.get(
             'truncation', 'error'
         ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'

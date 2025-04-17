@@ -60,6 +60,7 @@ python3 -m recipe.dapo_cl.src.main_dapo \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.train_batch_size=${train_prompt_bsz} \
     data.truncation='left' \
+    data.filter_overlong_prompts=True \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
