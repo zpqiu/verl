@@ -154,7 +154,7 @@ def extract_answer_part(response):
         return match.group(1)
     return ""
 
-def compute_score(solution_str, ground_truth) -> float:
+def compute_score(data_source, solution_str, ground_truth, extra_info):
     response = extract_qwen_output(solution_str)
     # # extract <answer>...</answer>
     # final_answers = [extract_answer_part(response) for response in responses]

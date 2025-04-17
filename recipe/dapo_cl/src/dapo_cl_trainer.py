@@ -46,9 +46,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                                         tokenizer=self.tokenizer,
                                         processor=self.processor,
                                         config=self.config)
-        assert self.train_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
         # use sampler for better ckpt resume
         # ==== CL ====
         from .rl_sampler import DynamicSampler
@@ -75,9 +72,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     tokenizer=self.tokenizer,
                                     processor=self.processor,
                                     config=self.config)
-        assert self.val_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+        
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             # Validation datasets are sent to inference engines as a whole batch,
