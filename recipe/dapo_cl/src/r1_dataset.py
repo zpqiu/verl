@@ -26,8 +26,8 @@ class R1Dataset(RLHFDataset):
     ):
         super().__init__(data_files, tokenizer, config, processor)
 
-        if 'difficulty' in self.dataframe.columns:
-            self.difficulties = self.dataframe['difficulty'].values.tolist()
+        if 'difficulty' in self.dataframe.features:
+            self.difficulties = self.dataframe['difficulty']
         else:
             self.difficulties = None
 
