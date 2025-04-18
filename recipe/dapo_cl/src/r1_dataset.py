@@ -41,25 +41,6 @@ class R1Dataset(RLHFDataset):
 
     def _read_files_and_tokenize(self):
         dataframes = []
-        for parquet_file in self.parquet_files:
-            # read parquet files and cache
-            dataframe = pd.read_parquet(parquet_file)
-            dataframes.append(dataframe)
-        self.dataframe = pd.concat(dataframes)
-
-        print(f'original dataset len: {len(self.dataframe)}')
-
-        # filter out too long prompts
-        tokenizer = self.tokenizer
-        prompt_key = self.prompt_key
-        self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: 0 < len(
-            tokenizer.encode(self._wrap_prompt(doc[prompt_key]))) <= self.max_prompt_length,
-                                                             axis=1)]
-
-        print(f'filter dataset len: {len(self.dataframe)}')
-
-    def _read_files_and_tokenize(self):
-        dataframes = []
         for parquet_file in self.data_files:
             # read parquet files and cache
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
