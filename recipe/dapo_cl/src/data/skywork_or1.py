@@ -43,7 +43,7 @@ if __name__ == '__main__':
             data = {
                 "data_source": example.pop('data_source'),
                 "prompt": example.pop('prompt'),
-                "difficulty": extra_info['model_difficulty']['DeepSeek-R1-Distill-Qwen-7B'],
+                "difficulty": extra_info['model_difficulty']['DeepSeek-R1-Distill-Qwen-1.5B'],
                 "ability": "math",
                 "reward_model": example.pop('reward_model'),
                 "extra_info": extra_info
