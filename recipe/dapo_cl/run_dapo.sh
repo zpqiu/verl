@@ -4,7 +4,7 @@ set -euxo pipefail
 current_dir="$(dirname "$(readlink -f "$0")")"
 
 project_name='alexq_qwen2_5_7b_zero'
-exp_name='DAPO-CL-Skywork-OR1-Diff2'
+exp_name='DAPO-Skywork-OR1'
 
 adv_estimator=grpo
 
@@ -33,10 +33,7 @@ train_prompt_mini_bsz=32
 n_resp_per_prompt=16
 
 # Ray
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
-WORKING_DIR=${WORKING_DIR:-"${PWD}"}
-RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-1}
 # Paths
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"${current_dir}/ckpts/${project_name}/${exp_name}"}
@@ -53,9 +50,7 @@ infer_micro_batch_size=null
 train_micro_batch_size=null
 offload=False
 
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.dapo_cl.src.main_dapo \
+python3 -m recipe.dapo.src.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="[$current_dir/data/aime24/test.parquet,$current_dir/data/math500/test.parquet]" \
     data.prompt_key=prompt \
@@ -66,6 +61,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.train_batch_size=${train_prompt_bsz} \
     data.truncation='left' \
     data.filter_overlong_prompts=True \
+    data.custom_cls.path=${current_dir}/src/r1_dataset.py \
+    data.custom_cls.name=R1Dataset \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
