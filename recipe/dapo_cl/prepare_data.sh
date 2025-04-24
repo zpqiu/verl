@@ -5,6 +5,9 @@ cd "$(dirname "$0")"
 
 # 创建数据目录（如果不存在）
 mkdir -p data
+mkdir -p data/skywork_or1
+mkdir -p data/math500
+mkdir -p data/aime24
 
 # 运行数据准备脚本
 echo "开始准备数据..."

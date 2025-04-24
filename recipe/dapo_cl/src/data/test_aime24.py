@@ -15,12 +15,12 @@
 Preprocess the GSM8k dataset to parquet format
 """
 
+import argparse
 import os
+
 import datasets
 
 from verl.utils.hdfs_io import copy, makedirs
-import argparse
-
 
 OPEN_R1_SYS = ("You are a helpful AI Assistant that provides well-reasoned and detailed responses. "
                "You first think about the reasoning process as an internal monologue and then provide the user with the answer. "
@@ -36,7 +36,7 @@ if __name__ == '__main__':
 
     data_source = 'HuggingFaceH4/aime_2024'
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
-    train_dataset = datasets.load_dataset(data_source, split='train', trust_remote_code=True)
+    train_dataset = datasets.load_dataset(data_source, split='train')
 
     instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
