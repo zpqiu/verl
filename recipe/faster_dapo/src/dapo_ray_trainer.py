@@ -337,7 +337,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             next_batch_size = int((prompt_bsz - num_prompt_in_batch) / keep_ratio)
                             # 按 16 整数向上去整
                             gpu_num = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-                            next_batch_size = int(np.ceil(next_batch_size / gpu_num) * gpu_num)
+                            next_batch_size = min(int(np.ceil(next_batch_size / gpu_num) * gpu_num), self.config.data.train_batch_size)
                             print(f"{num_prompt_in_batch=} < {prompt_bsz=}, next generation batch size: {next_batch_size}")  # noqa: E501
                             self.current_batch_size = next_batch_size
                             max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
