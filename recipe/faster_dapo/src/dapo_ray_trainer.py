@@ -135,16 +135,16 @@ class RayDAPOTrainer(RayPPOTrainer):
             collate_fn=collate_fn,
         )
 
-        assert len(self.train_dataloader) >= 1
+        # assert len(self.train_dataloader) >= 1
         assert len(self.val_dataloader) == 1, (
             "Validation dataloader must have a single batch,"
             + " which inference engines will schedule the memory themselves."
         )
 
-        print(f"Size of train dataloader: {len(self.train_dataloader)}")
+        # print(f"Size of train dataloader: {len(self.train_dataloader)}")
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = (len(self.train_dataset) // self.config.data.train_batch_size) * self.config.trainer.total_epochs
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
