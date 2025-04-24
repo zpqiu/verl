@@ -319,7 +319,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         kept_prompt_uids = [
                             uid
                             for uid, std in prompt_uid2metric_std.items()
-                            if std > 0 or len(prompt_uid2metric_vals[uid]) == 1 or prompt_uid2metric_mean[uid] > 0.8 or prompt_uid2metric_mean[uid] < 0.1
+                            if (std > 0 or len(prompt_uid2metric_vals[uid]) == 1) and (prompt_uid2metric_mean[uid] <= 0.8 and prompt_uid2metric_mean[uid] >= 0.1)
                         ]
                         num_prompt_in_batch += len(kept_prompt_uids)
                         keep_ratio = len(kept_prompt_uids) / len(prompt_uid2metric_std)
