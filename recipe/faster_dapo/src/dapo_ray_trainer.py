@@ -311,16 +311,18 @@ class RayDAPOTrainer(RayPPOTrainer):
                         ):
                             prompt_uid2metric_vals[uid].append(metric_val)
 
-                        prompt_uid2metric_std = {}
+                        prompt_uid2metric_mean, prompt_uid2metric_std = {}, {}
                         for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
+                            prompt_uid2metric_mean[prompt_uid] = np.mean(metric_vals)
                             prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
 
                         kept_prompt_uids = [
                             uid
                             for uid, std in prompt_uid2metric_std.items()
-                            if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
+                            if std > 0 or len(prompt_uid2metric_vals[uid]) == 1 or prompt_uid2metric_mean[uid] > 0.8 or prompt_uid2metric_mean[uid] < 0.1
                         ]
                         num_prompt_in_batch += len(kept_prompt_uids)
+                        keep_ratio = len(kept_prompt_uids) / len(prompt_uid2metric_std)
 
                         kept_traj_idxs = []
                         for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
@@ -332,8 +334,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                         prompt_bsz = self.config.data.train_batch_size
                         if num_prompt_in_batch < prompt_bsz:
-                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}, next generation batch size: {prompt_bsz - num_prompt_in_batch}")  # noqa: E501
-                            self.current_batch_size = prompt_bsz - num_prompt_in_batch
+                            next_batch_size = int((prompt_bsz - num_prompt_in_batch) / keep_ratio)
+                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}, next generation batch size: {next_batch_size}")  # noqa: E501
+                            self.current_batch_size = next_batch_size
                             max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
                             if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
                                 print(f"{num_gen_batches=}. Keep generating...")
