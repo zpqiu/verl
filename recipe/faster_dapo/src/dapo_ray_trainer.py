@@ -108,7 +108,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
-        from verl.recipe.dapo_cl.src.dynamic_batch_sampler import BatchSampler
+        from .dynamic_batch_sampler import BatchSampler
         batch_sampler = BatchSampler(sampler, self._dynamic_batch_size, drop_last=False)
 
         self.train_dataloader = StatefulDataLoader(
