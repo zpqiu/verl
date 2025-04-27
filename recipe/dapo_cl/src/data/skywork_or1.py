@@ -15,11 +15,13 @@
 Preprocess the GSM8k dataset to parquet format
 """
 
-import os
-import datasets
-import json
-from verl.utils.hdfs_io import copy, makedirs
 import argparse
+import json
+import os
+
+import datasets
+
+from verl.utils.hdfs_io import copy, makedirs
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -39,10 +41,12 @@ if __name__ == '__main__':
 
         def process_fn(example, idx):
             extra_info = example.pop('extra_info')
+            prompt = example.pop('prompt')
+            extra_info['question'] = prompt[0]['content']
 
             data = {
                 "data_source": example.pop('data_source'),
-                "prompt": example.pop('prompt'),
+                "prompt": prompt,
                 "difficulty": extra_info['model_difficulty']['DeepSeek-R1-Distill-Qwen-1.5B'],
                 "ability": "math",
                 "reward_model": example.pop('reward_model'),
@@ -51,8 +55,20 @@ if __name__ == '__main__':
             return data
 
         return process_fn
+    
+    def filter_invalid_data(example):
+        diff1 = example['extra_info']['model_difficulty']['DeepSeek-R1-Distill-Qwen-1.5B']
+        diff2 = example['extra_info']['model_difficulty']['DeepSeek-R1-Distill-Qwen-7B']
+        diff3 = example['extra_info']['model_difficulty']['DeepSeek-R1-Distill-Qwen-32B']
+
+        if diff1 == 16 and diff2 == 16 and diff3 == 16 and "aime" not in example['data_source']:
+            return False
+
+        return True
 
     train_dataset = train_dataset.shuffle(seed=42)
+    train_dataset = train_dataset.filter(filter_invalid_data)
+    print(f"After filtering, the dataset size is {len(train_dataset)}")
     train_dataset = train_dataset.map(function=make_map_fn(), with_indices=True)
 
     local_dir = args.local_dir

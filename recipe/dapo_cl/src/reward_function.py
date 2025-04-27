@@ -1,9 +1,11 @@
-import torch
-import re
 import random
+import re
+
+import torch
 from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, ExprExtractionConfig, parse, verify
-from sympy import zoo, nan
+from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
+from sympy import nan, zoo
+
 
 def last_boxed_only_string(string):
     idx = string.rfind("\\boxed")
@@ -200,3 +202,70 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
             "acc": 0.0,
             "pred": final_answer,
         }
+
+def compute_score_skywork(data_source, solution_str, ground_truth, extra_info):
+    do_print = False
+    if random.randint(0, 512) == 1:  
+        do_print = True
+    if do_print:
+        print(f"Response Case: {solution_str}")
+        print(f"GT Case: {ground_truth}")
+
+    ground_truth = [ground_truth] if isinstance(ground_truth, str) else ground_truth
+
+    # We always take the final solution
+    if "</think>" in solution_str:
+        solution_str = solution_str.split("</think>")[1]
+    
+    # 0 in case parsing cannot be completed
+    try:
+        math_verify_parsed = parse(solution_str, parsing_timeout=5)
+    except Exception:
+        return {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": "",
+        }
+    
+    # 0 if parsing is problematic
+    if len(math_verify_parsed) < 2:
+        return {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": "",
+        }
+    
+    # We perform a quick string match first
+    if math_verify_parsed[1] in ground_truth:
+        return {
+            "score": 1.0,
+            "acc": 1.0,
+            "pred": math_verify_parsed[1],
+        }
+    
+    # We now fallback to semantic verification
+    for gt in ground_truth:
+        try:
+            if len(math_verify_parsed[1]) > 10 and len(math_verify_parsed[1]) > len(gt) * 5:
+                print(f"[WARNNING] Skip verification for {math_verify_parsed[1]}, gt: {gt}")
+                continue
+
+            if verify(
+                parse(f"\\boxed{{{gt}}}", parsing_timeout=5),
+                math_verify_parsed,
+                timeout_seconds=5,
+            ):
+                return {
+                    "score": 1.0,
+                    "acc": 1.0,
+                    "pred": math_verify_parsed[1],
+                }
+        except Exception:
+            continue
+    
+    # Very unlikely to be correct after the above matches
+    return {
+        "score": -1.0,
+        "acc": 0.0,
+        "pred": "",
+    }
