@@ -17,23 +17,26 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import uuid
-from pprint import pprint
-from copy import deepcopy
 from collections import defaultdict
-from tqdm import tqdm
+from copy import deepcopy
+from pprint import pprint
+
 import numpy as np
 import torch
-
 from omegaconf import OmegaConf, open_dict
-from verl.utils.dataset.rl_dataset import collate_fn
+from torch.utils.data import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
+from tqdm import tqdm
 
 from verl import DataProto
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _timer, apply_kl_penalty, compute_advantage, AdvantageEstimator
-from verl.trainer.ppo.metric_utils import (compute_data_metrics, compute_throughout_metrics, compute_timing_metrics,
-                                           reduce_metrics)
-
-from .r1_dataset import R1Dataset
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    reduce_metrics,
+)
+from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _timer, apply_kl_penalty, compute_advantage
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
 
 class RayDAPOTrainer(RayPPOTrainer):
@@ -42,10 +45,25 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     def _create_dataloader(self):
         # TODO: we have to make sure the batch size is divisible by the dp size
-        self.train_dataset = R1Dataset(data_files=self.config.data.train_files,
-                                        tokenizer=self.tokenizer,
-                                        processor=self.processor,
-                                        config=self.config)
+        from verl.utils.import_utils import load_extern_type
+
+        if "custom_cls" in self.config.data and self.config.data.custom_cls.get("path", None) is not None:
+            dataset_cls = load_extern_type(self.config.data.custom_cls.path, self.config.data.custom_cls.name)
+            if not issubclass(dataset_cls, Dataset):
+                raise TypeError(
+                    f"The custom dataset class '{self.config.data.custom_cls.name}' from "
+                    f"'{self.config.data.custom_cls.path}' must inherit from torch.utils.data.Dataset"
+                )
+        else:
+            dataset_cls = RLHFDataset
+
+        self.train_dataset = dataset_cls(
+            data_files=self.config.data.train_files,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            config=self.config.data,
+        )
+
         # use sampler for better ckpt resume
         # ==== CL ====
         from .rl_sampler import DynamicSampler
@@ -68,7 +86,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
 
-        self.val_dataset = R1Dataset(data_files=self.config.data.val_files,
+        self.val_dataset = dataset_cls(data_files=self.config.data.val_files,
                                     tokenizer=self.tokenizer,
                                     processor=self.processor,
                                     config=self.config)
@@ -108,15 +126,15 @@ class RayDAPOTrainer(RayPPOTrainer):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
-
     def fit(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
+
+        from verl.utils.tracking import Tracking
 
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,

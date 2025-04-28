@@ -1,13 +1,13 @@
-import pandas as pd
-from typing import List, Union, Optional
+from typing import List, Optional, Union
 
 import datasets
-from transformers import PreTrainedTokenizer, ProcessorMixin
+import pandas as pd
 from omegaconf import DictConfig
+from transformers import PreTrainedTokenizer, ProcessorMixin
 
-from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.utils.model import compute_position_id_with_mask
 
 PROMPT_TEMPLATE = ("A conversation between User and Assistant. The User asks a question, and the Assistant solves it. "
                    "The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. "
