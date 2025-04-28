@@ -35,9 +35,9 @@ enable_overlong_buffer=True
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
 
-ppo_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 2 ))
-log_prob_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 3 ))
-max_num_batched_tokens=$(( (max_prompt_length + max_response_length) * 3 ))
+ppo_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 4 ))
+log_prob_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 6 ))
+max_num_batched_tokens=$(( (max_prompt_length + max_response_length) * 6 ))
 
 loss_agg_mode="token-mean"
 
@@ -141,7 +141,7 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
-    custom_reward_function.path=${current_dir}/src/reward_function.py \
+    custom_reward_function.path=${current_dir}/../reward_funcs/skywork.py \
     custom_reward_function.name=compute_score \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
