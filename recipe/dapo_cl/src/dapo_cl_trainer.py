@@ -89,7 +89,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         self.val_dataset = dataset_cls(data_files=self.config.data.val_files,
                                     tokenizer=self.tokenizer,
                                     processor=self.processor,
-                                    config=self.config)
+                                    config=self.config.data)
         
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
