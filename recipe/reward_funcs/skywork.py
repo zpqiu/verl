@@ -16,7 +16,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     
     # 0 in case parsing cannot be completed
     try:
-        math_verify_parsed = parse(solution_str, parsing_timeout=5)
+        math_verify_parsed = parse(solution_str[-300:], parsing_timeout=5)
     except Exception:
         result = {
             "score": -1.0,
