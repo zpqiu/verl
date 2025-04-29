@@ -32,7 +32,7 @@ class AsyncDAPORewardManager:
         reward_fn_key="data_source",
         max_resp_len=None,
         overlong_buffer_cfg=None,
-        max_workers=1,  # 新增参数，用于控制线程池大小
+        max_workers=16,  # 新增参数，用于控制线程池大小
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
