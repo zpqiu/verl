@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -41,7 +41,11 @@ class AsyncDAPORewardManager:
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = max_resp_len
         self.max_workers = max_workers
-
+        self.base_url = os.environ.get("XVERIFY_URL", None)
+        if self.base_url is None:
+            raise ValueError("XVERIFY_URL is not set")
+        print(f"XVERIFY_URL: {self.base_url}")
+        
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
                 f"max_resp_len must be provided if {overlong_buffer_cfg=}, but got None"
@@ -68,7 +72,8 @@ class AsyncDAPORewardManager:
 
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
         data_source = data_item.non_tensor_batch[self.reward_fn_key]
-        extra_info = data_item.non_tensor_batch.get("extra_info", None)
+        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        extra_info["url"] = self.base_url
 
         result = self.compute_score(
             data_source=data_source,
