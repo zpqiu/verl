@@ -14,15 +14,17 @@
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
-from .dapo_cl_trainer import RayDAPOTrainer
-
 import os
-import ray
+
 import hydra
+import ray
+
+from .dapo_cl_trainer import RayDAPOTrainer
 
 
 def get_custom_reward_fn(config):
-    import importlib.util, os
+    import importlib.util
+    import os
 
     reward_fn_config = config.get("custom_reward_function") or {}
     file_path = reward_fn_config.get("path")
@@ -76,10 +78,12 @@ def run_ppo(config) -> None:
 class TaskRunner:
 
     def run(self, config):
-        from verl.utils.fs import copy_to_local
         # print initial config
         from pprint import pprint
+
         from omegaconf import OmegaConf
+
+        from verl.utils.fs import copy_to_local
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
@@ -87,21 +91,21 @@ class TaskRunner:
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
 
         # instantiate tokenizer
-        from verl.utils import hf_tokenizer, hf_processor
+        from verl.utils import hf_processor, hf_tokenizer
         tokenizer = hf_tokenizer(local_path)
         processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
 
         # define worker classes
         if config.actor_rollout_ref.actor.strategy == 'fsdp':
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
             from verl.single_controller.ray import RayWorkerGroup
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == 'megatron':
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             ray_worker_group_cls = NVMegatronRayWorkerGroup
 
         else:
@@ -156,6 +160,9 @@ class TaskRunner:
         elif reward_manager_name == 'dapo':
             from verl.workers.reward_manager import DAPORewardManager
             reward_manager_cls = DAPORewardManager
+        elif reward_manager_name == 'async_dapo':
+            from .async_dapo import AsyncDAPORewardManager
+            reward_manager_cls = AsyncDAPORewardManager
         else:
 
             raise NotImplementedError
@@ -166,7 +173,8 @@ class TaskRunner:
                                        compute_score=compute_score,
                                        reward_fn_key=config.data.reward_fn_key,
                                        max_resp_len=config.data.max_response_length,
-                                       overlong_buffer_cfg=config.reward_model.overlong_buffer)
+                                       overlong_buffer_cfg=config.reward_model.overlong_buffer,
+                                       max_workers=16)
 
         # Note that we always use function-based RM for validation
         val_reward_fn = reward_manager_cls(tokenizer=tokenizer,
@@ -174,7 +182,8 @@ class TaskRunner:
                                            compute_score=compute_score,
                                            reward_fn_key=config.data.reward_fn_key,
                                            max_resp_len=config.data.max_response_length,
-                                           overlong_buffer_cfg=config.reward_model.overlong_buffer)
+                                           overlong_buffer_cfg=config.reward_model.overlong_buffer,
+                                           max_workers=16)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         trainer = RayDAPOTrainer(config=config,
