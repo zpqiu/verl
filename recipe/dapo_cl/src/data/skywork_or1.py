@@ -43,13 +43,14 @@ if __name__ == '__main__':
             extra_info = example.pop('extra_info')
             prompt = example.pop('prompt')
             extra_info['question'] = prompt[0]['content']
+            gt = example.pop('reward_model')['ground_truth'][0]
 
             data = {
                 "data_source": example.pop('data_source'),
                 "prompt": prompt,
                 "difficulty": extra_info['model_difficulty']['DeepSeek-R1-Distill-Qwen-1.5B'],
                 "ability": "math",
-                "reward_model": example.pop('reward_model'),
+                "reward_model": {"ground_truth": gt, "style": "rule"},
                 "extra_info": extra_info
             }
             return data
