@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -32,7 +33,8 @@ class AsyncDAPORewardManager:
         reward_fn_key="data_source",
         max_resp_len=None,
         overlong_buffer_cfg=None,
-        max_workers=16,  # 新增参数，用于控制线程池大小
+        max_workers=16,  # 默认值
+        base_url=None,   # 必需参数
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
@@ -41,10 +43,11 @@ class AsyncDAPORewardManager:
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = max_resp_len
         self.max_workers = max_workers
-        self.base_url = os.environ.get("XVERIFY_URL", None)
+        self.base_url = base_url
+        
         if self.base_url is None:
-            raise ValueError("XVERIFY_URL is not set")
-        print(f"XVERIFY_URL: {self.base_url}")
+            raise ValueError("base_url must be provided")
+        print(f"AsyncDAPO initialized with base_url: {self.base_url}, max_workers: {self.max_workers}")
         
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -52,6 +55,8 @@ class AsyncDAPORewardManager:
             )
 
     def _process_single_item(self, data_item, i):
+        # print time
+        # print(f"[AsyncDAPORewardManager] Processing item {i} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         """处理单个数据项的计算"""
         prompt_ids = data_item.batch["prompts"]
         prompt_length = prompt_ids.shape[-1]
@@ -75,12 +80,14 @@ class AsyncDAPORewardManager:
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
         extra_info["url"] = self.base_url
 
+        # print(f"[AsyncDAPORewardManager] Computing score for item {i} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         result = self.compute_score(
             data_source=data_source,
             solution_str=response_str,
             ground_truth=ground_truth,
             extra_info=extra_info,
         )
+        # print(f"[AsyncDAPORewardManager] Score computed for item {i} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         score: float
         if isinstance(result, dict):
