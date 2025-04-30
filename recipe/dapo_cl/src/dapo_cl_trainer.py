@@ -75,7 +75,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 batch_size=self.config.data.train_batch_size,
                                 threshold_for_next_level=0.5,
                                 threshold_for_prev_level=-0.4,
-                                mix_harder_samples=0.0,
                                 init_level=0)
         # ==== CL ====
 
