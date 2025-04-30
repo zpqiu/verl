@@ -305,7 +305,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
 
     # first, use rule-based verification
     correct, pred = rule_based_verify(final_answer, ground_truth, strict_box_verify=False)
-    correct2, _ = rule_based_verify(final_answer, ground_truth, strict_box_verify=True)
+    correct2, pred2 = rule_based_verify(final_answer, ground_truth, strict_box_verify=True)
     if correct or correct2:
         if do_print:
             print(f"[Correct][Rule-based] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
@@ -315,6 +315,17 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
             "pred": pred,
         }
 
+    # 如果 ground_truth 和 pred pred2 都是纯数字，且仍旧没有通过 rule-based verification，则返回 -1
+    if ground_truth.replace(".", "").isdigit() and \
+        ((pred is not None and pred.replace(".", "").isdigit()) or \
+         (pred2 is not None and pred2.replace(".", "").isdigit())):
+        if do_print:
+            print(f"[Incorrect][Rule-based] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
+        return {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": f"{pred} or {pred2}",
+        }
     # # extract <answer>...</answer>
     final_answer = final_answer[-400:]
 
