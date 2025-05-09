@@ -273,6 +273,77 @@ def extract_answer_part(response):
     return ""
 
 
+class TermColors:
+    """终端颜色代码"""
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def format_verification_log(status, method, answer, ground_truth, question, response=None):
+    """格式化验证结果日志。
+    
+    Args:
+        status: 验证状态 (Correct/Incorrect/Invalid Format 等)
+        method: 验证方法 (Rule-based/xVerify 等)
+        answer: 模型给出的答案
+        ground_truth: 标准答案
+        question: 原始问题
+        response: 完整的模型响应（可选）
+    """
+    # 状态颜色映射
+    status_color = {
+        "Correct": TermColors.GREEN,
+        "Incorrect": TermColors.RED,
+        "Invalid Format": TermColors.YELLOW,
+        "Empty Answer": TermColors.YELLOW
+    }.get(status, TermColors.BLUE)
+    
+    # 创建装饰性边框
+    width = 80
+    top_border = f"{TermColors.BLUE}{'═' * width}{TermColors.ENDC}"
+    section_separator = f"{TermColors.BLUE}{'─' * width}{TermColors.ENDC}"
+    
+    # 格式化标题
+    title = f"{status_color}[{status}]{TermColors.ENDC} | {TermColors.BOLD}[{method}]{TermColors.ENDC}"
+    title = f"{title:^{width}}"
+    
+    # 格式化各个部分
+    def format_section(label, content):
+        lines = [f"{TermColors.BOLD}{label}:{TermColors.ENDC}"]
+        content_lines = content.strip().split('\n')
+        lines.extend(f"  {line}" for line in content_lines)  # 添加缩进
+        return '\n'.join(lines)
+    
+    # 组装所有部分
+    parts = [
+        top_border,
+        title,
+        section_separator,
+        format_section("Question", question),
+        section_separator,
+        format_section("Answer", answer),
+        section_separator,
+        format_section("Ground Truth", ground_truth)
+    ]
+    
+    # 如果有完整响应，添加到最后
+    if response is not None:
+        parts.extend([
+            section_separator,
+            format_section("Full Response", 
+                f"{response[:100]}...{response[-100:]}" if len(response) > 200 else response)
+        ])
+    
+    parts.append(top_border)
+    
+    return '\n'.join(parts)
+
+
 def compute_score(data_source, solution_str, ground_truth, extra_info):
     if extra_info is None or "question" not in extra_info or "url" not in extra_info:
         raise ValueError("Extra info is required and must contain 'question' and 'url'")
@@ -283,14 +354,15 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     if do_print:
         print(f"Response Case: {solution_str}, Question: {extra_info['question']}, GT: {ground_truth}")
 
-    if "aime" in data_source:
+    if "aime_2024" in data_source:
         do_print = True
 
     response = solution_str
 
     if not is_format_correct("<think>" + response):
         if do_print:
-            print(f"[Invalid Format] Response Case: {response[:100] + '...' + response[-100:] if len(response) > 200 else response}")
+            print(format_verification_log("Invalid Format", "Format Check", 
+                "[INVALID FORMAT]", ground_truth, extra_info["question"], response))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -299,7 +371,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     final_answer = extract_answer_part(response)
     if final_answer == "":
         if do_print:
-            print(f"[Empty Answer] Response Case: {response[:100] + '...' + response[-100:] if len(response) > 200 else response}")
+            print(format_verification_log("Empty Answer", "Format Check",
+                "[EMPTY ANSWER]", ground_truth, extra_info["question"], response))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -311,7 +384,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     correct2, pred2 = rule_based_verify(final_answer, ground_truth, strict_box_verify=True)
     if correct or correct2:
         if do_print:
-            print(f"[Correct][Rule-based] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
+            print(format_verification_log("Correct", "Rule-based",
+                final_answer, ground_truth, extra_info["question"]))
         return {
             "score": 1.0,
             "acc": 1.0,
@@ -323,7 +397,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
         ((pred is not None and pred.replace(".", "").isdigit()) or \
          (pred2 is not None and pred2.replace(".", "").isdigit())):
         if do_print:
-            print(f"[Incorrect][Rule-based] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
+            print(format_verification_log("Incorrect", "Rule-based",
+                final_answer, ground_truth, extra_info["question"]))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -333,7 +408,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     final_answer = last_boxed_only_string(final_answer)
     if final_answer is None:
         if do_print:
-            print(f"[Empty Answer] Response Case: {response[:100] + '...' + response[-100:] if len(response) > 200 else response}")
+            print(format_verification_log("Empty Answer", "Format Check",
+                "[EMPTY ANSWER]", ground_truth, extra_info["question"], response))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -343,7 +419,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
 
     if "".join(final_answer.split()) == "".join(ground_truth.split()):
         if do_print:
-            print(f"[Correct][Rule-based-Direct] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
+            print(format_verification_log("Correct", "Rule-based-Direct",
+                final_answer, ground_truth, extra_info["question"]))
         return {
             "score": 1.0,
             "acc": 1.0,
@@ -373,7 +450,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
         )
         if response_obj.choices[0].message.content == "Correct":
             if do_print:
-                print(f"[Correct][xVerify] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
+                print(format_verification_log("Correct", "xVerify",
+                    final_answer, ground_truth, extra_info["question"]))
             return {
                 "score": 1.0,
                 "acc": 1.0,
@@ -389,7 +467,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     
     # Very unlikely to be correct after the above matches
     if do_print:
-        print(f"[Incorrect][xVerify] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
+        print(format_verification_log("Incorrect", "xVerify",
+            final_answer, ground_truth, extra_info["question"]))
     return {
         "score": -1.0,
         "acc": 0.0,
