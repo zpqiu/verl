@@ -43,7 +43,7 @@ if __name__ == '__main__':
             extra_info = example.pop('extra_info')
             prompt = example.pop('prompt')
             extra_info['question'] = prompt[0]['content']
-            gt = example.pop('reward_model')['ground_truth'][0]
+            gt = eval(example.pop('reward_model')['ground_truth'])[0]
 
             data = {
                 "data_source": example.pop('data_source'),
