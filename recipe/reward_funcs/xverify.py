@@ -283,11 +283,14 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     if do_print:
         print(f"Response Case: {solution_str}, Question: {extra_info['question']}, GT: {ground_truth}")
 
+    if "aime" in data_source:
+        do_print = True
+
     response = solution_str
 
     if not is_format_correct("<think>" + response):
         if do_print:
-            print(f"[Invalid Format] Response Case: {response}")
+            print(f"[Invalid Format] Response Case: {response[:100] + '...' + response[-100:] if len(response) > 200 else response}")
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -296,7 +299,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     final_answer = extract_answer_part(response)
     if final_answer == "":
         if do_print:
-            print(f"[Empty Answer] Response Case: {response}")
+            print(f"[Empty Answer] Response Case: {response[:100] + '...' + response[-100:] if len(response) > 200 else response}")
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -327,8 +330,26 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
             "pred": f"{pred} or {pred2}",
         }
     # # extract <answer>...</answer>
-    final_answer = final_answer[-400:]
+    final_answer = last_boxed_only_string(final_answer)
+    if final_answer is None:
+        if do_print:
+            print(f"[Empty Answer] Response Case: {response[:100] + '...' + response[-100:] if len(response) > 200 else response}")
+        return {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": "[EMPTY ANSWER]",
+        }
+    final_answer = remove_boxed(final_answer)
 
+    if "".join(final_answer.split()) == "".join(ground_truth.split()):
+        if do_print:
+            print(f"[Correct][Rule-based-Direct] Answer: {final_answer}, GT: {ground_truth}, Question: {extra_info['question']}")
+        return {
+            "score": 1.0,
+            "acc": 1.0,
+            "pred": final_answer,
+        }
+    
     model = OpenAI(
         base_url=extra_info["url"],
         api_key="sk-proj-1234567890"
