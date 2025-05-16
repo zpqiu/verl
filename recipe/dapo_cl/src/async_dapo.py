@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
@@ -132,7 +132,7 @@ class AsyncDAPORewardManager:
                 return data.batch["rm_scores"]
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-        reward_extra_info = defaultdict(list)
+        reward_extra_info = defaultdict(OrderedDict)
         already_print_data_sources = {}
 
         # 使用线程池并发处理所有样本
@@ -157,7 +157,7 @@ class AsyncDAPORewardManager:
 
                 # 更新extra_info
                 for key, value in extra_info.items():
-                    reward_extra_info[key].append(value)
+                    reward_extra_info[key][i] = value
 
                 # 处理打印逻辑
                 if data_source not in already_print_data_sources:
@@ -170,11 +170,10 @@ class AsyncDAPORewardManager:
                     print("[ground_truth]", result["ground_truth"])
                     for key, value in extra_info.items():
                         print(f"[{key}]", value)
-
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
-                "reward_extra_info": reward_extra_info,
+                "reward_extra_info": {k: [v[i] for i in sorted(v.keys())] for k, v in reward_extra_info.items()},
             }
         else:
             return reward_tensor
