@@ -65,6 +65,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         val_reward_fn=None,
     ):
         self.current_batch_size = config.data.train_batch_size
+        # 初始化黑名单集合
+        self.blacklist_indices = set()
         super().__init__(
             config,
             tokenizer,
@@ -109,7 +111,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             sampler = SequentialSampler(data_source=self.train_dataset)
 
         from .dynamic_batch_sampler import BatchSampler
-        batch_sampler = BatchSampler(sampler, self._dynamic_batch_size, drop_last=False)
+        batch_sampler = BatchSampler(sampler, self._dynamic_batch_size, drop_last=True)
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
@@ -198,6 +200,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         timing_raw = defaultdict(float)
         batch = None
+        new_batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
         num_sampled_prompts = 0
@@ -205,7 +208,21 @@ class RayDAPOTrainer(RayPPOTrainer):
             for batch_dict in self.train_dataloader:
                 metrics = {}
 
-                new_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                prefetched_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                pre_bsz = len(prefetched_batch)
+
+                # 根据黑名单过滤 batch
+                prefetched_batch = self._filter_batch_by_blacklist(prefetched_batch)
+                new_batch = prefetched_batch if new_batch is None else DataProto.concat([new_batch, prefetched_batch])
+                if len(new_batch) < self.current_batch_size:
+                    next_batch_size = self.current_batch_size - len(new_batch)
+                    print(f"{len(new_batch)=} < {self.current_batch_size=}, next generation batch size: {next_batch_size}")  # noqa: E501
+                    continue
+                else:
+                    # Align the batch
+                    new_batch = new_batch[:self.current_batch_size]
+                    
+                # new_batch: DataProto = DataProto.from_single_dict(filtered_batch_dict)
                 num_gen_batches += 1
                 num_sampled_prompts += len(new_batch.batch["input_ids"])
                 # pop those keys for generation
@@ -319,7 +336,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                         kept_prompt_uids = [
                             uid
                             for uid, std in prompt_uid2metric_std.items()
-                            if (std > 0 or len(prompt_uid2metric_vals[uid]) == 1) and (prompt_uid2metric_mean[uid] <= 0.8)
+                            if (std > 0 or len(prompt_uid2metric_vals[uid]) == 1) and
+                            (prompt_uid2metric_mean[uid] < self.config.algorithm.filter_groups.mean_upper and 
+                             prompt_uid2metric_mean[uid] > self.config.algorithm.filter_groups.mean_lower)
                         ]
                         num_prompt_in_batch += len(kept_prompt_uids)
                         keep_ratio = len(kept_prompt_uids) / len(prompt_uid2metric_std)
@@ -453,3 +472,22 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+    def _filter_batch_by_blacklist(self, batch: DataProto):
+        """
+        根据黑名单过滤 batch
+        Args:
+            batch: 原始的 batch
+        Returns:
+            filtered_batch: 过滤后的 batch
+        """
+        if not self.blacklist_indices or "index" not in batch.non_tensor_batch:
+            return batch
+            
+        indices = batch.non_tensor_batch["index"]
+        # 找出不在黑名单中的样本索引
+        keep_mask = np.array([idx not in self.blacklist_indices for idx in indices])
+        keep_indices = np.where(keep_mask)[0]
+            
+        # 过滤 batch 和 non_tensor_batch
+        return batch[keep_indices]
