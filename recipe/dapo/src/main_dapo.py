@@ -166,27 +166,36 @@ class TaskRunner:
             from verl.workers.reward_manager import DAPORewardManager
 
             reward_manager_cls = DAPORewardManager
+        elif reward_manager_name == 'async_dapo':
+            from .async_dapo import AsyncDAPORewardManager
+            reward_manager_cls = AsyncDAPORewardManager
         else:
             raise NotImplementedError
 
         compute_score = get_custom_reward_fn(config)
-        reward_fn = reward_manager_cls(
-            tokenizer=tokenizer,
-            num_examine=0,
-            compute_score=compute_score,
-            reward_fn_key=config.data.reward_fn_key,
-            max_resp_len=config.data.max_response_length,
-            overlong_buffer_cfg=config.reward_model.overlong_buffer,
-        )
+        # 构建通用的reward manager参数
+        reward_manager_kwargs = {
+            "tokenizer": tokenizer,
+            "num_examine": 0,
+            "compute_score": compute_score,
+            "reward_fn_key": config.data.reward_fn_key,
+            "max_resp_len": config.data.max_response_length,
+            "overlong_buffer_cfg": config.reward_model.overlong_buffer
+        }
+        
+        # 为AsyncDAPO添加特殊配置
+        if reward_manager_name == 'async_dapo':
+            async_dapo_cfg = config.reward_model.get("async_dapo", {})
+            reward_manager_kwargs.update({
+                "max_workers": async_dapo_cfg.get("max_workers", 16),
+                "base_url": async_dapo_cfg.get("base_url"),
+            })
+
+        reward_fn = reward_manager_cls(**reward_manager_kwargs)
 
         # Note that we always use function-based RM for validation
         val_reward_fn = reward_manager_cls(
-            tokenizer=tokenizer,
-            num_examine=1,
-            compute_score=compute_score,
-            reward_fn_key=config.data.reward_fn_key,
-            max_resp_len=config.data.max_response_length,
-            overlong_buffer_cfg=config.reward_model.overlong_buffer,
+            **{**reward_manager_kwargs, "num_examine": 1}  # 复用参数，只修改num_examine
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
