@@ -14,7 +14,7 @@ class DynamicSampler(Sampler[int]):
                  total_steps,
                  batch_size,
                  init_level=0,
-                 mix_harder_samples=0.2,
+                 current_level_ratio=0.75,
                  smooth_window=3,
                  threshold_for_next_level=0.75,
                  threshold_for_prev_level=0.3,
@@ -28,15 +28,15 @@ class DynamicSampler(Sampler[int]):
             total_steps: Total number of batches to generate during iteration
             batch_size: Number of samples in each batch
             init_level: Initial difficulty level to start sampling from (default: 0)
-            mix_harder_samples: Proportion of samples to draw from the next difficulty level (default: 0.2)
-            smooth_window: Number of accuracy values to average when determining level transitions (default: 2)
+            current_level_ratio: Proportion of samples to draw from current level (default: 0.4)
+            smooth_window: Number of accuracy values to average when determining level transitions (default: 3)
             threshold_for_next_level: Accuracy threshold to increase difficulty level (default: 0.75)
             threshold_for_prev_level: Accuracy threshold to decrease difficulty level (default: 0.3)
         """
         assert len(difficulties) == len(data_source), "difficulties and data_source should have the same length"
         assert all(
             isinstance(difficulty, int) for difficulty in difficulties), "difficulties should be a list of int values"
-        assert 0 <= mix_harder_samples <= 1, "mix_harder_samples should be between 0 and 1"
+        assert 0 <= current_level_ratio <= 1, "current_level_ratio should be between 0 and 1"
         assert threshold_for_next_level > threshold_for_prev_level, "threshold_for_next_level should be greater than threshold_for_prev_level"
         assert smooth_window > 0, "smooth_window should be greater than 0"
 
@@ -50,20 +50,21 @@ class DynamicSampler(Sampler[int]):
         self.total_steps = total_steps
         self.batch_size = batch_size
         self.current_level = init_level
-        self.mix_harder_samples = mix_harder_samples
+        self.current_level_ratio = current_level_ratio
         self.smooth_window = smooth_window
         self.threshold_for_next_level = threshold_for_next_level
         self.threshold_for_prev_level = threshold_for_prev_level
         self.accuracy_history = []
         self.seed = seed
 
-        self._current_level_sample_count_in_batch = int((1 - self.mix_harder_samples) * self.batch_size)
+        self._current_level_sample_count_in_batch = int(self.current_level_ratio * self.batch_size)
 
         # Create a SubsetRandomSampler for each difficulty level
         self.samplers = {}
         self.iters = {}
         self.difficulty_level_subsets = {}
         self.difficulty_level_yielded = {}
+        self.level_sample_counts = {}  # 存储每个难度级别的样本数量
         self._split_into_subsets()
 
     def set_current_level(self, level):
@@ -78,11 +79,35 @@ class DynamicSampler(Sampler[int]):
                 self.difficulty_level_subsets[level_index] = []
             self.difficulty_level_subsets[level_index].append(i)
 
+        # 统计每个难度级别的样本数量
         for level, indices in self.difficulty_level_subsets.items():
+            self.level_sample_counts[level] = len(indices)
             generator = torch.Generator()
             generator.manual_seed(self.seed)
             self.samplers[level] = SubsetRandomSampler(indices, generator=generator)
             self.iters[level] = iter(self.samplers[level])
+
+    def _get_level_proportions(self, max_level):
+        """计算每个难度级别的样本比例"""
+        total_samples = 0
+        level_counts = {}
+
+        # min_level = max(0, max_level - 2)
+        min_level = 0
+        
+        # 只统计小于当前难度级别的样本
+        for level in range(min_level, max_level):
+            if level in self.level_sample_counts:
+                count = self.level_sample_counts[level]
+                level_counts[level] = count
+                total_samples += count
+                
+        # 计算比例
+        level_proportions = {}
+        for level, count in level_counts.items():
+            level_proportions[level] = count / total_samples if total_samples > 0 else 0
+            
+        return level_proportions
 
     def _sample_from_level(self, level, batch_size):
 
@@ -109,17 +134,50 @@ class DynamicSampler(Sampler[int]):
             self.difficulty_level_yielded[level] = 0
         self.difficulty_level_yielded[level] += batch_size
 
+    def _sample_from_lower_levels(self, batch_size):
+        """根据样本比例从较低难度级别中采样"""
+        if self.current_level == 0:
+            return []
+            
+        level_proportions = self._get_level_proportions(self.current_level)
+        sampled_indices = []
+        
+        # 根据比例从每个较低难度级别采样
+        remaining_samples = batch_size
+        for level, proportion in level_proportions.items():
+            if remaining_samples <= 0:
+                break
+            # 计算应该从这个级别采样的数量
+            samples_from_level = int(batch_size * proportion)
+            if samples_from_level > 0:
+                indices = self._sample_from_level(level, samples_from_level)
+                sampled_indices.extend(indices)
+                remaining_samples -= samples_from_level
+                
+        # 如果还有剩余的样本需要采集，从最高可用的难度级别中采样
+        if remaining_samples > 0 and level_proportions:
+            max_available_level = max(level_proportions.keys())
+            additional_samples = self._sample_from_level(max_available_level, remaining_samples)
+            sampled_indices.extend(additional_samples)
+            
+        return sampled_indices
+
     def __iter__(self):
         # Logic for mixed sampling
         for _ in range(self.total_steps):
-            current_level_samples = self._sample_from_level(self.current_level,
-                                                            self._current_level_sample_count_in_batch)
-            if self.mix_harder_samples > 0:
-                next_level_samples = self._sample_from_level(
-                    self.current_level + 1, self.batch_size - self._current_level_sample_count_in_batch)
-                combined_samples = current_level_samples + next_level_samples
+            # 从当前难度级别采样固定比例
+            if self.current_level == 0:
+                combined_samples = self._sample_from_level(self.current_level,
+                                                          self.batch_size)
             else:
-                combined_samples = current_level_samples
+                current_level_samples = self._sample_from_level(self.current_level,
+                                                          self._current_level_sample_count_in_batch)
+            
+                # 从较低难度级别采样剩余样本
+                lower_level_samples = self._sample_from_lower_levels(
+                    self.batch_size - self._current_level_sample_count_in_batch)
+                combined_samples = current_level_samples + lower_level_samples
+                
             yield from combined_samples
 
     def update_sampling_policy(self, latest_accuracy):
@@ -198,7 +256,7 @@ if __name__ == "__main__":
                              total_steps=len(train_dataset) * 10 // 3,
                              batch_size=3,
                              init_level=0,
-                             mix_harder_samples=0.2,
+                             current_level_ratio=0.4,
                              smooth_window=2,
                              threshold_for_next_level=0.75,
                              threshold_for_prev_level=0.3,
@@ -233,7 +291,7 @@ if __name__ == "__main__":
                               total_steps=len(train_dataset) * 10 // 3,
                               batch_size=3,
                               init_level=0,
-                              mix_harder_samples=0.2,
+                              current_level_ratio=0.4,
                               smooth_window=2,
                               threshold_for_next_level=0.75,
                               threshold_for_prev_level=0.3,
