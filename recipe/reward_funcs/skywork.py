@@ -1,6 +1,35 @@
 import random
+import re
 
 from math_verify import parse, verify
+
+
+def is_format_correct(completion):
+    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    # pattern = r"^<think>.*?</think>"
+    if not re.match(pattern, completion, re.DOTALL | re.MULTILINE):
+        return False
+    # check if all tags only appear once
+    tags = ["<think>", "</think>", "<answer>", "</answer>"]
+    # tags = ["<think>", "</think>"]
+    for tag in tags:
+        if completion.count(tag) != 1:
+            return False
+    
+    # check if <think>...</think> is empty
+    think_pattern = r"<think>(.*?)</think>"
+    think_match = re.search(think_pattern, completion, re.DOTALL | re.MULTILINE)
+    if think_match and think_match.group(1).strip() == "":
+        return False
+    
+    return True
+
+def extract_answer_part(response):
+    pattern = r"<answer>(.*?)</answer>"
+    match = re.search(pattern, response, re.DOTALL | re.MULTILINE)
+    if match:
+        return match.group(1)
+    return ""
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info):
@@ -13,10 +42,37 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
         print(f"Ground Truth: {ground_truth}")
 
     ground_truth = [ground_truth] if isinstance(ground_truth, str) else ground_truth
+
+    if not is_format_correct("<think>" + solution_str):
+        result = {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": "[INVALID FORMAT]",
+        }
+        if should_log:
+            print("Invalid format")
+            print(f"Final Result: {result}")
+            print("================================\n")
+        return result
+    # # extract <answer>...</answer>
+    final_answer = extract_answer_part(solution_str)
+
+    if final_answer == "":
+        result = {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": "[EMPTY ANSWER]",
+        }
+        if should_log:
+            print("Empty answer")
+            print(f"Final Result: {result}")
+            print("================================\n")
+        return result
+
     
     # 0 in case parsing cannot be completed
     try:
-        math_verify_parsed = parse(solution_str[-300:], parsing_timeout=5)
+        math_verify_parsed = parse(final_answer, parsing_timeout=5)
     except Exception:
         result = {
             "score": -1.0,

@@ -284,7 +284,7 @@ class TermColors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-def format_verification_log(status, method, answer, ground_truth, question, response=None):
+def format_verification_log(status, method, answer, ground_truth, question, response=None, source=None):
     """格式化验证结果日志。
     
     Args:
@@ -294,7 +294,10 @@ def format_verification_log(status, method, answer, ground_truth, question, resp
         ground_truth: 标准答案
         question: 原始问题
         response: 完整的模型响应（可选）
+        source: 数据源（可选）
     """
+    if source is not None and "aime_2024" in source:
+        print(f"[AIME2024] {status} | {answer.strip()} | {ground_truth.strip()}")
     # 状态颜色映射
     status_color = {
         "Correct": TermColors.GREEN,
@@ -362,7 +365,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     if not is_format_correct("<think>" + response):
         if do_print:
             print(format_verification_log("Invalid Format", "Format Check", 
-                "[INVALID FORMAT]", ground_truth, extra_info["question"], response))
+                "[INVALID FORMAT]", ground_truth, extra_info["question"], response, source=data_source))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -372,7 +375,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     if final_answer == "":
         if do_print:
             print(format_verification_log("Empty Answer", "Format Check",
-                "[EMPTY ANSWER]", ground_truth, extra_info["question"], response))
+                "[EMPTY ANSWER]", ground_truth, extra_info["question"], response, source=data_source))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -385,7 +388,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     if correct or correct2:
         if do_print:
             print(format_verification_log("Correct", "Rule-based",
-                final_answer, ground_truth, extra_info["question"]))
+                final_answer, ground_truth, extra_info["question"], source=data_source))
         return {
             "score": 1.0,
             "acc": 1.0,
@@ -398,7 +401,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
          (pred2 is not None and pred2.replace(".", "").isdigit())):
         if do_print:
             print(format_verification_log("Incorrect", "Rule-based",
-                final_answer, ground_truth, extra_info["question"]))
+                final_answer, ground_truth, extra_info["question"], source=data_source))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -409,7 +412,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     if final_answer is None:
         if do_print:
             print(format_verification_log("Empty Answer", "Format Check",
-                "[EMPTY ANSWER]", ground_truth, extra_info["question"], response))
+                "[EMPTY ANSWER]", ground_truth, extra_info["question"], response, source=data_source))
         return {
             "score": -1.0,
             "acc": 0.0,
@@ -420,7 +423,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     if "".join(final_answer.split()) == "".join(ground_truth.split()):
         if do_print:
             print(format_verification_log("Correct", "Rule-based-Direct",
-                final_answer, ground_truth, extra_info["question"]))
+                final_answer, ground_truth, extra_info["question"], source=data_source))
         return {
             "score": 1.0,
             "acc": 1.0,
@@ -451,7 +454,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
         if response_obj.choices[0].message.content == "Correct":
             if do_print:
                 print(format_verification_log("Correct", "xVerify",
-                    final_answer, ground_truth, extra_info["question"]))
+                    final_answer, ground_truth, extra_info["question"], source=data_source))
             return {
                 "score": 1.0,
                 "acc": 1.0,
@@ -468,7 +471,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
     # Very unlikely to be correct after the above matches
     if do_print:
         print(format_verification_log("Incorrect", "xVerify",
-            final_answer, ground_truth, extra_info["question"]))
+            final_answer, ground_truth, extra_info["question"], source=data_source))
     return {
         "score": -1.0,
         "acc": 0.0,
