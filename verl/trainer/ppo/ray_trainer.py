@@ -744,6 +744,8 @@ class RayPPOTrainer:
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_rollout_wg,
             )
+            # offload weights to reduce peak memory
+            self.async_rollout_manager.sleep()
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
