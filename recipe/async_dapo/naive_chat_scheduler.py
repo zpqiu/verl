@@ -17,12 +17,14 @@ from collections import defaultdict
 from typing import Any, Dict, List
 
 import numpy as np
+import requests
 import torch
 from omegaconf import DictConfig
 from openai.types.chat.chat_completion import ChatCompletion
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
+from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.rollout.async_server import ChatCompletionScheduler
 
 
@@ -81,10 +83,35 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
             max_cache_size: int, max cache size of request_id to address mapping.
         """
         super().__init__(config, model_path, server_addresses, max_cache_size)
-        self.compute_score = get_custom_reward_fn(config)
-        if self.compute_score is None:
-            raise ValueError("No custom score function provided")
+        # self.compute_score = get_custom_reward_fn(config)
+        # if self.compute_score is None:
+            # raise ValueError("No custom score function provided")
         self.reward_fn_key = "data_source"
+
+    async def compute_score(self, solution_str, ground_truth):
+        """调用 math_verify_service.py 中的评分函数计算分数"""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.post("http://localhost:8000/score", json={
+                    "solution_str": solution_str,
+                    "ground_truth": ground_truth,
+                }) as response:
+                    result = await response.json()
+                    
+                    return {
+                        "score": result["score"],
+                        "acc": result["acc"],
+                        "pred": result["pred"]
+                    }
+            
+        except Exception as e:
+            print(f"Error in compute_score: {e}")
+            return {
+                "score": -1.0,
+                "acc": 0.0,
+                "pred": ""
+            }
 
     async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
         kwargs = dict(
@@ -96,9 +123,26 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
 
         do_sample = batch.meta_info.get("do_sample", True)
         is_validate = batch.meta_info.get("validate", False)
-        if not do_sample or is_validate:
-            kwargs["n"] = 1
-            kwargs["temperature"] = 0
+        # if not do_sample or is_validate:
+        #     kwargs["n"] = 1
+        #     kwargs["temperature"] = 0
+        if not do_sample:
+            kwargs = {
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
+            }
+        elif is_validate:
+            # TODO: try **
+            kwargs = {
+                "top_k": self.config.val_kwargs.top_k,
+                "top_p": self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "n": 1,  # if validate, already repeat in ray_trainer
+            }
 
         kwargs.update(sampling_params)
         print(f"[NaiveChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
@@ -108,8 +152,8 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
             conversation, batch_conversations, batch_scores, batch_index, ground_truth, data_source, extra_info = (
                 info["conversation"],
                 info["batch_conversations"],
-                info["batch_index"],
                 info["batch_scores"],
+                info["batch_index"],
                 info["ground_truth"],
                 info["data_source"],
                 info["extra_info"],
@@ -122,13 +166,13 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
                 chat.append({"role": choice.message.role, "content": choice.message.content})
                 conversations.append(chat)
 
-                result = self.compute_score(
-                    data_source=data_source,
+                result = await self.compute_score(
                     solution_str=choice.message.content,
                     ground_truth=ground_truth,
-                    extra_info=extra_info,
                 )
                 scores.append(result)
+                # if result["acc"] == 1:
+                #     print(f"[DEBUG] {batch_index} {ground_truth} {choice.message.content}")
 
             batch_scores[batch_index] = scores
             batch_conversations[batch_index] = conversations
@@ -197,20 +241,33 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         # responses: [response]
         # TODO: mask out tools calling tokens?
         responses = [sequence[len(prompts[i // n]) :] for i, sequence in enumerate(sequences)]
-        valid_response_length_list = [len(response) for response in responses]
 
-        prompts = self.tokenizer(prompts, return_tensors="pt", padding="longest", padding_side="left")
+        # prompts = self.tokenizer(prompts, return_tensors="pt", padding="longest", padding_side="left")
+
+        prompt_input_ids = batch.batch["input_ids"]  # (bs, prompt_length)
+        # left-padded attention_mask
+        prompt_attention_mask = batch.batch["attention_mask"]
+        prompt_position_ids = batch.batch["position_ids"]
+
         responses = self.tokenizer(responses, return_tensors="pt", padding="longest", padding_side="right")
         if n > 1:
-            prompts["input_ids"] = prompts["input_ids"].repeat_interleave(n, dim=0)
-            prompts["attention_mask"] = prompts["attention_mask"].repeat_interleave(n, dim=0)
+            prompt_input_ids =prompt_input_ids.repeat_interleave(n, dim=0)
+            prompt_position_ids = prompt_position_ids.repeat_interleave(n, dim=0)
+            prompt_attention_mask = prompt_attention_mask.repeat_interleave(n, dim=0)
 
-        input_ids = torch.cat([prompts["input_ids"], responses["input_ids"]], dim=1)
-        attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
+        valid_response_length_list = responses["attention_mask"].sum(dim=-1).view(-1).tolist()
+
+        response_input_ids = pad_sequence_to_length(responses["input_ids"], self.config.response_length, self.tokenizer.pad_token_id)
+        response_attention_mask = pad_sequence_to_length(responses["attention_mask"], self.config.response_length, 0)
+
+        input_ids = torch.cat([prompt_input_ids, response_input_ids], dim=1)
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
 
-        reward_tensor = torch.zeros_like(responses, dtype=torch.float32)
+        reward_tensor = torch.zeros_like(response_input_ids, dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        # flatten batch_scores
+        batch_scores = [score for scores in batch_scores for score in scores]
         for i in range(len(batch_scores)):
             result, valid_resp_length = batch_scores[i], valid_response_length_list[i]
             score: float
@@ -225,10 +282,20 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
             reward = score
             reward_tensor[i, valid_resp_length - 1] = reward
 
+        if n > 1:
+            repeated_non_tensor_batch = {}
+            for key, val in batch.non_tensor_batch.items():
+                repeated_non_tensor_batch[key] = np.repeat(val, n, axis=0)
+        else:
+            repeated_non_tensor_batch = batch.non_tensor_batch
+
+        for k, v in reward_extra_info.items():
+            repeated_non_tensor_batch[k] = np.array(v)
+
         batch = TensorDict(
             {
-                "prompts": prompts["input_ids"],
-                "responses": responses["input_ids"],
+                "prompts": prompt_input_ids,
+                "responses": response_input_ids,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
@@ -237,6 +304,4 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
             batch_size=len(input_ids),
         )
 
-        non_tensor_batch = {k: np.array(v) for k, v in reward_extra_info.items()}
-
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        return DataProto(batch=batch, non_tensor_batch=repeated_non_tensor_batch)
