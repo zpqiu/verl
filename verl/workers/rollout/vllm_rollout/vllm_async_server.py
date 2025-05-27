@@ -50,7 +50,23 @@ class ExternalRayDistributedExecutor(Executor):
 
         # Make sure subprocess in same namespace as parent actor.
         # actor name format: {name_prefix}WorkerDict_{pg_idx}:{local_rank}
-        ray.init(namespace=namespace)
+        # Modified by Ruiyi Wang (05/17/2025)
+        # ray.init(namespace=namespace)
+        try:
+            print(f"Trying to connect to Ray with namespace: {namespace}")
+            # Check if we can connect to existing Ray instance before initializing
+            ray.init(address="auto", namespace=namespace, ignore_reinit_error=True)
+
+            # # After connecting, check again for actors
+            # actor_names = [actor_name for actor_name in ray.util.list_named_actors() if actor_name.startswith(f"{wg_prefix}WorkerDict")]
+
+            # with open(f"{self.vllm_config.instance_id}.log", "w") as f:
+            #     f.write(f"[DEBUG] After connecting to Ray, found actors: {actor_names}\\n")
+
+        except Exception as e:
+            print(f"Error connecting to Ray: {e}")
+            # Fallback to regular initialization if connecting fails
+            ray.init(namespace=namespace)
         actor_names = [actor_name for actor_name in ray.util.list_named_actors() if actor_name.startswith(f"{wg_prefix}WorkerDict")]
 
         vllm_tp_size = self.vllm_config.parallel_config.tensor_parallel_size
