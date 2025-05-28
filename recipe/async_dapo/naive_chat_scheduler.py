@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import os
+import random
 from collections import defaultdict
 from typing import Any, Dict, List
 
@@ -24,7 +25,7 @@ from openai.types.chat.chat_completion import ChatCompletion
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
-from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from verl.utils.torch_functional import pad_sequence_to_length
 from verl.workers.rollout.async_server import ChatCompletionScheduler
 
 
@@ -87,6 +88,7 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         # if self.compute_score is None:
             # raise ValueError("No custom score function provided")
         self.reward_fn_key = "data_source"
+        print(f'[DEBUG] NaiveChatCompletionScheduler config max_response_length: {config.response_length}')
 
     async def compute_score(self, solution_str, ground_truth):
         """调用 math_verify_service.py 中的评分函数计算分数"""
@@ -171,11 +173,58 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
                     ground_truth=ground_truth,
                 )
                 scores.append(result)
-                # if result["acc"] == 1:
-                #     print(f"[DEBUG] {batch_index} {ground_truth} {choice.message.content}")
 
             batch_scores[batch_index] = scores
             batch_conversations[batch_index] = conversations
+
+            should_log = random.randint(0, 128) == 1
+            if should_log:
+                print(f"\n{'='*60}")
+                print(f"📊 批次调试信息 - 索引: {batch_index}")
+                print(f"{'='*60}")
+
+                # print completions.usage
+                print(f"🔍 使用情况:")
+                print(f"  请求数: {completions.usage.prompt_tokens}")
+                print(f"  响应数: {completions.usage.completion_tokens}")
+                print(f"  总令牌数: {completions.usage.total_tokens}")
+                
+                # 分数信息
+                print(f"🎯 评分结果:")
+                for i, score in enumerate(scores):
+                    if isinstance(score, dict):
+                        print(f"  响应 {i+1}: 分数={score.get('score', 'N/A'):.3f}, "
+                              f"准确率={score.get('acc', 'N/A')}, "
+                              f"预测='{score.get('pred', 'N/A')[:50]}{'...' if len(str(score.get('pred', ''))) > 50 else ''}'")
+                    else:
+                        print(f"  响应 {i+1}: 分数={score}")
+                
+                # 对话内容
+                print(f"\n💬 对话内容:")
+                for conv_idx, conv in enumerate(conversations):
+                    print(f"  ┌─ 对话 {conv_idx + 1} ─────────────────────")
+                    for msg_idx, msg in enumerate(conv):
+                        role_emoji = "👤" if msg['role'] == 'user' else "🤖" if msg['role'] == 'assistant' else "🔧"
+                        content = msg['content']
+                        # 如果内容太长，显示开头和结尾，隐藏中间部分
+                        if len(content) > 200:
+                            head_length = 80
+                            tail_length = 80
+                            content = (content[:head_length] + 
+                                     f"\n  │     ... (隐藏了 {len(content) - head_length - tail_length} 个字符) ...\n  │     " + 
+                                     content[-tail_length:])
+                        
+                        # 处理多行内容的显示
+                        content_lines = content.split('\n')
+                        if len(content_lines) > 1:
+                            print(f"  │ {role_emoji} {msg['role']}: {content_lines[0]}")
+                            for line in content_lines[1:]:
+                                print(f"  │     {line}")
+                        else:
+                            print(f"  │ {role_emoji} {msg['role']}: {content}")
+                    print(f"  └{'─' * 35}")
+                
+                print(f"{'='*60}\n")
 
             # NOTE: we can call tools and resubmit chat completions here.
             # call_tools(completions, info)
@@ -249,13 +298,16 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         prompt_attention_mask = batch.batch["attention_mask"]
         prompt_position_ids = batch.batch["position_ids"]
 
-        responses = self.tokenizer(responses, return_tensors="pt", padding="longest", padding_side="right")
+        responses = self.tokenizer(responses, return_tensors="pt", padding_side="right", max_length=self.config.response_length, padding="max_length", truncation=True)
         if n > 1:
             prompt_input_ids =prompt_input_ids.repeat_interleave(n, dim=0)
             prompt_position_ids = prompt_position_ids.repeat_interleave(n, dim=0)
             prompt_attention_mask = prompt_attention_mask.repeat_interleave(n, dim=0)
 
         valid_response_length_list = responses["attention_mask"].sum(dim=-1).view(-1).tolist()
+
+        # if responses["input_ids"].shape[1] > 1024*4:
+        print(f"[DEBUG] {responses['input_ids'].shape}")
 
         response_input_ids = pad_sequence_to_length(responses["input_ids"], self.config.response_length, self.tokenizer.pad_token_id)
         response_attention_mask = pad_sequence_to_length(responses["attention_mask"], self.config.response_length, 0)
