@@ -168,6 +168,16 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
                 chat.append({"role": choice.message.role, "content": choice.message.content})
                 conversations.append(chat)
 
+                # if the content is very very short, we should print it and its corresponding information and highlight it
+                if len(choice.message.content) < 20:
+                    print(f"\n{'='*60}")
+                    print(f"\n🚨 检测到超短响应 (批次 {batch_index}):")
+                    print(f"  📏 长度: {len(choice.message.content)} 字符")
+                    print(f"  📝 内容: \033[93m'{choice.message.content}'\033[0m")
+                    print(f"  🎯 参考答案: {str(ground_truth)[:100]}{'...' if len(str(ground_truth)) > 100 else ''}")
+                    print(f"  📊 数据源: {data_source}")
+                    print(f"{'='*60}")
+
                 result = await self.compute_score(
                     solution_str=choice.message.content,
                     ground_truth=ground_truth,
