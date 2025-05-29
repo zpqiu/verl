@@ -122,6 +122,8 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
             temperature=self.config.temperature,
             top_p=self.config.top_p,
         )
+        if self.config.get("stop_token_ids", None) is not None:
+            kwargs["stop_token_ids"] = list(self.config.stop_token_ids)
 
         do_sample = batch.meta_info.get("do_sample", True)
         is_validate = batch.meta_info.get("validate", False)
@@ -129,22 +131,22 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         #     kwargs["n"] = 1
         #     kwargs["temperature"] = 0
         if not do_sample:
-            kwargs = {
+            kwargs.update({
                 "best_of": 1,
                 "top_p": 1.0,
                 "top_k": -1,
                 "min_p": 0.0,
                 "temperature": 0,
                 "n": 1,  # if greedy, only 1 response
-            }
+            })
         elif is_validate:
             # TODO: try **
-            kwargs = {
+            kwargs.update({
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
-            }
+            })
 
         kwargs.update(sampling_params)
         print(f"[NaiveChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
@@ -295,7 +297,8 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         assert len(batch_conversations) == len(prompts) * n
 
         # sequences: [prompt + response]
-        sequences = [self.tokenizer.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False) for conversation in batch_conversations]
+        # Qwen 2.5 tokenizer will add a newline at the end of the response, we need to strip it
+        sequences = [self.tokenizer.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False).strip() for conversation in batch_conversations]
 
         # responses: [response]
         # TODO: mask out tools calling tokens?
