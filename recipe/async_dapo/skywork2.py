@@ -43,6 +43,18 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
 
     ground_truth = [ground_truth] if isinstance(ground_truth, str) else ground_truth
 
+    if not is_format_correct(solution_str.strip()):
+        result = {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": "[INVALID FORMAT]",
+        }
+        if should_log:
+            print("Invalid format")
+            print(f"Final Result: {result}")
+            print("================================\n")
+        return result
+
     # extract <answer>...</answer>
     final_answer = extract_answer_part(solution_str)
 
