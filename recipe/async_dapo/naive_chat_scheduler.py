@@ -177,7 +177,7 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
             batch_scores[batch_index] = scores
             batch_conversations[batch_index] = conversations
 
-            should_log = random.randint(0, 128) == 1
+            should_log = random.randint(0, 256) == 1
             if should_log:
                 print(f"\n{'='*60}")
                 print(f"📊 批次调试信息 - 索引: {batch_index}")
