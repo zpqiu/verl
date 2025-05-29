@@ -298,7 +298,8 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
 
         # sequences: [prompt + response]
         # Qwen 2.5 tokenizer will add a newline at the end of the response, we need to strip it
-        sequences = [self.tokenizer.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False).rstrip() for conversation in batch_conversations]
+        sequences = [self.tokenizer.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)[:-len('<|im_end|>\n')] for conversation in batch_conversations]
+        sequences = [sequence + self.tokenizer.eos_token for sequence in sequences]
 
         # responses: [response]
         # TODO: mask out tools calling tokens?
