@@ -245,7 +245,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
-                            self.async_rollout_manager.wake_up()
+                            # if batch is None, it means the first batch is generated, we need to wake up the async rollout manager
+                            if batch is None:
+                                self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             # self.async_rollout_manager.sleep()
 
