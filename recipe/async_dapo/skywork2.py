@@ -7,7 +7,7 @@ from math_verify import parse, verify
 def is_format_correct(completion):
     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
     # pattern = r"^<think>.*?</think>"
-    if not re.match(pattern, completion, re.DOTALL | re.MULTILINE):
+    if not re.match(pattern, completion, re.DOTALL):
         return False
     # check if all tags only appear once
     tags = ["<think>", "</think>", "<answer>", "</answer>"]
@@ -18,7 +18,7 @@ def is_format_correct(completion):
     
     # check if <think>...</think> is empty
     think_pattern = r"<think>(.*?)</think>"
-    think_match = re.search(think_pattern, completion, re.DOTALL | re.MULTILINE)
+    think_match = re.search(think_pattern, completion, re.DOTALL)
     if think_match and think_match.group(1).strip() == "":
         return False
     
@@ -26,7 +26,7 @@ def is_format_correct(completion):
 
 def extract_answer_part(response):
     pattern = r"<answer>(.*?)</answer>"
-    match = re.search(pattern, response, re.DOTALL | re.MULTILINE)
+    match = re.search(pattern, response, re.DOTALL)
     if match:
         return match.group(1)
     return ""

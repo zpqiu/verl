@@ -87,7 +87,7 @@ class HealthResponse(BaseModel):
 def is_format_correct(completion: str) -> bool:
     """检查完成文本的格式是否正确"""
     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
-    if not re.match(pattern, completion, re.DOTALL | re.MULTILINE):
+    if not re.match(pattern, completion, re.DOTALL):
         return False
     
     # 检查所有标签是否只出现一次
@@ -98,7 +98,7 @@ def is_format_correct(completion: str) -> bool:
     
     # 检查 <think>...</think> 是否为空
     think_pattern = r"<think>(.*?)</think>"
-    think_match = re.search(think_pattern, completion, re.DOTALL | re.MULTILINE)
+    think_match = re.search(think_pattern, completion, re.DOTALL)
     if think_match and think_match.group(1).strip() == "":
         return False
     
@@ -107,7 +107,7 @@ def is_format_correct(completion: str) -> bool:
 def extract_answer_part(response: str) -> str:
     """从响应中提取答案部分"""
     pattern = r"<answer>(.*?)</answer>"
-    match = re.search(pattern, response, re.DOTALL | re.MULTILINE)
+    match = re.search(pattern, response, re.DOTALL)
     if match:
         return match.group(1)
     return ""
