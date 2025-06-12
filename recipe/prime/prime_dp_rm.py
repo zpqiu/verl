@@ -47,11 +47,6 @@ class DataParallelPRIMERewardModel:
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
 
-        if self.use_fused_kernels:
-            from verl.utils.experimental.torch_functional import FusedLinearForPPO
-
-            self.fused_linear_for_ppo = FusedLinearForPPO()
-
     def _forward_micro_batch(self, micro_batch, prompt_length):
         input_ids = micro_batch["input_ids"]
         batch_size, seqlen = input_ids.shape
@@ -82,17 +77,11 @@ class DataParallelPRIMERewardModel:
                 attention_mask=None,
                 position_ids=position_ids_rmpad,
                 use_cache=False,
+                return_dict=self.use_fused_kernels,
             )
 
             if self.use_fused_kernels:
-                hidden_states = output.last_hidden_state
-                vocab_weights = self.reward_module.lm_head.weight
-
-                rm_log_labels, _ = self.fused_linear_for_ppo(
-                    hidden_states=hidden_states.squeeze(0),
-                    vocab_weights=vocab_weights,
-                    input_ids=input_ids_rmpad_rolled,
-                )
+                rm_log_labels = output.log_probs.squeeze(0)  # (total_nnz,)
                 rm_log_labels = rm_log_labels.to(torch.float32)
 
             else:
@@ -112,17 +101,11 @@ class DataParallelPRIMERewardModel:
                 attention_mask=micro_batch["attention_mask"],
                 position_ids=micro_batch["position_ids"],
                 use_cache=False,
+                return_dict=self.use_fused_kernels,
             )
 
             if self.use_fused_kernels:
-                hidden_states = output.last_hidden_state
-                vocab_weights = self.reward_module.lm_head.weight
-
-                rm_log_labels, _ = self.fused_linear_for_ppo.forward(
-                    hidden_states=hidden_states[:, :-1, :],
-                    vocab_weights=vocab_weights,
-                    input_ids=micro_batch["input_ids"][:, 1:],
-                )
+                rm_log_labels = output.log_probs[:, :-1]  # (bsz, seq_length)
                 rm_log_labels = rm_log_labels.to(torch.float32)
 
             else:
@@ -142,18 +125,11 @@ class DataParallelPRIMERewardModel:
                     )
 
                     if self.use_fused_kernels:
-                        hidden_states = ref_output.last_hidden_state
-                        vocab_weights = self.ref_module.lm_head.weight
-
-                        ref_log_labels, _ = self.fused_linear_for_ppo(
-                            hidden_states=hidden_states.squeeze(0),
-                            vocab_weights=vocab_weights,
-                            input_ids=input_ids_rmpad_rolled,
-                        )
+                        ref_log_labels = ref_output.log_probs.squeeze(0)  # (total_nnz,)
                         ref_log_labels = ref_log_labels.to(torch.float32)
 
                     else:
-                        logits = ref_output.logits.squeeze(0)
+                        ref_output_logits = ref_output.logits.squeeze(0)
                         ref_log_labels = verl_F.logprobs_from_logits(logits=ref_output_logits, labels=input_ids_rmpad_rolled)
 
                     ref_log_labels = gather_outpus_and_unpad(ref_log_labels, gather_dim=0, unpad_dim=0, padding_size=pad_size)
@@ -167,14 +143,7 @@ class DataParallelPRIMERewardModel:
                     )
 
                     if self.use_fused_kernels:
-                        hidden_states = ref_output.last_hidden_state
-                        vocab_weights = self.ref_module.lm_head.weight
-
-                        ref_log_labels, _ = self.fused_linear_for_ppo.forward(
-                            hidden_states=hidden_states[:, :-1, :],
-                            vocab_weights=vocab_weights,
-                            input_ids=micro_batch["input_ids"][:, 1:],
-                        )
+                        ref_log_labels = ref_output.log_probs[:, :-1]  # (batch_size, seq_length)
                         ref_log_labels = ref_log_labels.to(torch.float32)
 
                     else:
