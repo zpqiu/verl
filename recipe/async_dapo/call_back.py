@@ -23,6 +23,7 @@ class RewardCompletionCallback(CompletionCallback):
     def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
         super().__init__(config, scheduler)
         self.max_response_length = config.data.max_response_length
+        self._local_query_answer()
 
         # TODO: add reward manager to calculate reward score once a sample finish
     
