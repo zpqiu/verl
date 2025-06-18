@@ -5,7 +5,6 @@ import logging
 from collections import defaultdict
 from typing import Any, Dict, List
 
-import datasets
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -23,35 +22,19 @@ class RewardCompletionCallback(CompletionCallback):
     def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
         super().__init__(config, scheduler)
         self.max_response_length = config.data.max_response_length
-        self._local_query_answer()
+        
+        print(f"[Callback] 数据集加载逻辑已移至 math_verify_service.py")
 
         # TODO: add reward manager to calculate reward score once a sample finish
-    
-    def _local_query_answer(self):
-        ds = datasets.load_dataset('pe-nlp/Skywork-OR1-RL-Data-Math', split='math')
-        prompt2answer = {}
-        for example in ds:
-            prompt = example.pop('prompt')[0]['content']
-            ground_truth = example.pop('ground_truth')
-            prompt2answer[prompt] = ground_truth
-        
-        self.prompt2answer = prompt2answer
 
-    async def compute_score(self, solution_str, ground_truth):
+    async def compute_score(self, solution_str, prompt):
         """调用 math_verify_service.py 中的评分函数计算分数"""
-        if ground_truth is None:
-            return {
-                "score": -1.0,
-                "acc": 0.0,
-                "pred": "[Failed to get ground truth]"
-            }
-        
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
                 async with session.post("http://localhost:8000/score", json={
                     "solution_str": "<think>" + solution_str,
-                    "ground_truth": ground_truth,
+                    "prompt": prompt,
                 }) as response:
                     result = await response.json()
                     
@@ -79,16 +62,7 @@ class RewardCompletionCallback(CompletionCallback):
             return
         
         question = messages[1]["content"]
-        ground_truth = self.prompt2answer.get(question, None)
-        if ground_truth is None:
-            print(f"Failed to get ground truth for {question}")
-            message["score"] = -1.0
-            message["acc"] = 0.0
-            message["pred"] = "[Failed to get ground truth]"
-            messages.append(message)
-            return
-        
-        ret = await self.compute_score(message["content"], ground_truth)
+        ret = await self.compute_score(message["content"], question)
 
         message["score"] = ret["score"]
         message["acc"] = ret["acc"]
