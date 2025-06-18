@@ -12,6 +12,7 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
+import datasets
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -26,6 +27,33 @@ except ImportError:
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 全局变量存储数据集
+PROMPT_TO_ANSWER: Dict[str, str] = {}
+
+def load_dataset():
+    """加载数据集并构建prompt到answer的映射"""
+    global PROMPT_TO_ANSWER
+    try:
+        logger.info("正在加载 Skywork-OR1-RL-Data-Math 数据集...")
+        ds = datasets.load_dataset('pe-nlp/Skywork-OR1-RL-Data-Math', split='math')
+        
+        prompt2answer = {}
+        for example in ds:
+            prompt = example['prompt'][0]['content']
+            ground_truth = example['ground_truth']
+            prompt2answer[prompt] = ground_truth
+        
+        PROMPT_TO_ANSWER = prompt2answer
+        logger.info(f"成功加载 {len(PROMPT_TO_ANSWER)} 个问答对")
+        
+        # 打印前5个QA对进行验证
+        for i, (prompt, answer) in enumerate(list(PROMPT_TO_ANSWER.items())[:5]):
+            logger.info(f"样例 {i}: {prompt[:50]}... -> {answer}")
+            
+    except Exception as e:
+        logger.error(f"加载数据集失败: {e}")
+        PROMPT_TO_ANSWER = {}
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -45,12 +73,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 应用启动时加载数据集
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时的初始化操作"""
+    load_dataset()
+
 # Pydantic 模型定义
 class ScoreRequest(BaseModel):
     """评分请求模型"""
     data_source: Optional[str] = Field(None, description="数据源标识")
     solution_str: str = Field(..., description="模型生成的解答字符串")
-    ground_truth: Union[str, List[str]] = Field(..., description="标准答案（字符串或字符串列表）")
+    ground_truth: Optional[Union[str, List[str]]] = Field(None, description="标准答案（字符串或字符串列表），如果提供prompt则可为空")
+    prompt: Optional[str] = Field(None, description="问题prompt，如果提供则会自动查找ground_truth")
     extra_info: Optional[Dict[str, Any]] = Field(None, description="额外信息")
     enable_debug: Optional[bool] = Field(False, description="是否启用调试日志")
 
@@ -81,6 +116,8 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="服务状态")
     timestamp: str = Field(..., description="时间戳")
     math_verify_available: bool = Field(..., description="math-verify 库是否可用")
+    dataset_loaded: bool = Field(..., description="数据集是否已加载")
+    dataset_size: int = Field(..., description="数据集大小")
     version: str = Field(..., description="服务版本")
 
 # 核心函数（从 skywork2.py 移植）
@@ -279,6 +316,30 @@ async def score_single_answer(request: ScoreRequest) -> ScoreResponse:
         if not MATH_VERIFY_AVAILABLE:
             raise HTTPException(status_code=500, detail="math-verify 库未安装")
         
+        # 确定ground_truth
+        ground_truth = request.ground_truth
+        if ground_truth is None and request.prompt is not None:
+            # 从数据集中查找ground_truth
+            ground_truth = PROMPT_TO_ANSWER.get(request.prompt)
+            if ground_truth is None:
+                return ScoreResponse(
+                    score=-1.0,
+                    acc=0.0,
+                    pred="[PROMPT NOT FOUND]",
+                    format_correct=False,
+                    error="未找到对应的ground_truth",
+                    processing_time=asyncio.get_event_loop().time() - start_time
+                )
+        elif ground_truth is None:
+            return ScoreResponse(
+                score=-1.0,
+                acc=0.0,
+                pred="[NO GROUND TRUTH]",
+                format_correct=False,
+                error="必须提供ground_truth或prompt",
+                processing_time=asyncio.get_event_loop().time() - start_time
+            )
+        
         # 检查格式
         format_correct = is_format_correct(request.solution_str)
         
@@ -286,7 +347,7 @@ async def score_single_answer(request: ScoreRequest) -> ScoreResponse:
         score_result = compute_score(
             request.data_source,
             request.solution_str,
-            request.ground_truth,
+            ground_truth,
             request.extra_info,
             request.enable_debug
         )
@@ -315,6 +376,8 @@ async def score_single_answer(request: ScoreRequest) -> ScoreResponse:
             processing_time=processing_time
         )
 
+
+
 # API 端点
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -323,6 +386,8 @@ async def health_check():
         status="healthy",
         timestamp=datetime.now().isoformat(),
         math_verify_available=MATH_VERIFY_AVAILABLE,
+        dataset_loaded=bool(PROMPT_TO_ANSWER),
+        dataset_size=len(PROMPT_TO_ANSWER),
         version="1.0.1"
     )
 
@@ -377,6 +442,8 @@ async def score_answers_batch(request: BatchScoreRequest):
         error_msg = f"批量评分失败: {str(e)}"
         logger.error(f"{error_msg}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=error_msg)
+
+
 
 @app.get("/")
 async def root():
