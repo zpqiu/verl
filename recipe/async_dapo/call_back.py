@@ -40,7 +40,6 @@ class RewardCompletionCallback(CompletionCallback):
     async def compute_score(self, solution_str, ground_truth):
         """调用 math_verify_service.py 中的评分函数计算分数"""
         if ground_truth is None:
-            print(f"Failed to get ground truth for {solution_str[:20]}")
             return {
                 "score": -1.0,
                 "acc": 0.0,
@@ -79,7 +78,17 @@ class RewardCompletionCallback(CompletionCallback):
             message["pred"] = ""
             return
         
-        ret = await self.compute_score(message["content"], self.prompt2answer.get(messages[0]["content"], None))
+        question = messages[1]["content"]
+        ground_truth = self.prompt2answer.get(question, None)
+        if ground_truth is None:
+            print(f"Failed to get ground truth for {question}")
+            message["score"] = -1.0
+            message["acc"] = 0.0
+            message["pred"] = "[Failed to get ground truth]"
+            messages.append(message)
+            return
+        
+        ret = await self.compute_score(message["content"], ground_truth)
 
         message["score"] = ret["score"]
         message["acc"] = ret["acc"]
