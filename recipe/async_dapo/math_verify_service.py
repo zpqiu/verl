@@ -43,6 +43,14 @@ def load_dataset():
             prompt = example['prompt'][0]['content']
             ground_truth = example['ground_truth']
             prompt2answer[prompt] = ground_truth
+
+        # 加载 AIME 2024 数据集
+        logger.info("正在加载 AIME 2024 数据集...")
+        aime_ds = datasets.load_dataset('HuggingFaceH4/aime_2024', split='train')
+        for example in aime_ds:
+            prompt = example['problem']
+            ground_truth = example['answer']
+            prompt2answer[prompt] = ground_truth
         
         PROMPT_TO_ANSWER = prompt2answer
         logger.info(f"成功加载 {len(PROMPT_TO_ANSWER)} 个问答对")
