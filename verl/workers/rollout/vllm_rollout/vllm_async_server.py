@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -188,7 +189,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
+            # disable_mm_preprocessor_cache=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
@@ -218,8 +219,8 @@ class AsyncvLLMServer(AsyncServerBase):
             request_logger=RequestLogger(max_log_len=4096),
             chat_template=None,
             chat_template_content_format="auto",
-            enable_auto_tools=True,
-            tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
+            # enable_auto_tools=True,
+            # tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
         )
 
     async def chat_completion(self, raw_request: Request):
@@ -243,6 +244,38 @@ class AsyncvLLMServer(AsyncServerBase):
         await self.engine.wake_up()
 
     async def sleep(self):
+        import time
+        start_time = time.time()
+        while self.engine.output_processor.has_unfinished_requests():
+            running_request_ids = [x for x in self.engine.output_processor.request_states]
+            print(f"[DEBUG] Running request ids: {running_request_ids[:10]}")
+            print(f"Waiting for engine to finish or cancel {self.engine.output_processor.get_num_unfinished_requests()} requests...")
+            await asyncio.sleep(0.1)
+        end_time = time.time()
+        print(f"[DEBUG] Time taken to finish or cancel requests: {end_time - start_time} seconds")
         # TODO: https://github.com/vllm-project/vllm/issues/17103
         await self.engine.reset_prefix_cache()
         await self.engine.sleep()
+
+    async def abort_request(self, request_id: str):
+        """Abort a specific request by request_id.
+        
+        Args:
+            request_id: The request ID to abort.
+        """ 
+        try:
+            # Check if engine is available and healthy before aborting
+            if self.engine is None:
+                logger.warning(f"Engine not available, cannot abort request: {request_id}")
+                return
+            
+            # vLLM's AsyncLLM engine supports aborting requests
+            # await self.engine.abort(request_id)
+            await self.engine.abort(f"chatcmpl-{request_id}")
+
+            self.engine.output_processor.abort_requests([f"chatcmpl-{request_id}"])
+            
+        except Exception as e:
+            # Don't let abort failures crash the server - log as warning instead of error
+            logger.warning(f"Failed to abort request {request_id}, ignoring error: {e}")
+            # Don't re-raise the exception to avoid cascading failures

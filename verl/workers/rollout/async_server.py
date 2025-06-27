@@ -96,6 +96,11 @@ class AsyncServerBase(ABC):
         """Sleep engine to offload model weights and discard kv cache."""
         raise NotImplementedError
 
+    @abstractmethod
+    async def abort_request(self, request_id: str):
+        """Abort a specific request by request_id."""
+        raise NotImplementedError
+
 
 class AsyncLLMServerManager:
     """AsyncLLMServerManager manage a group of vllm instances, i.e AsyncvLLMServer."""
@@ -170,6 +175,7 @@ class AsyncLLMServerManager:
             self.chat_scheduler = ChatCompletionScheduler(
                 config=self.full_config,
                 server_addresses=self.server_addresses,
+                abort_callback=self.abort_requests,
             )
         except Exception as e:
             logger.exception(f"chat_scheduler init error: {e}")
@@ -212,7 +218,42 @@ class AsyncLLMServerManager:
         assert self.chat_scheduler is not None, "chat scheduler is not initialized."
 
         future = asyncio.run_coroutine_threadsafe(self.chat_scheduler.generate_sequences(prompts, **sampling_params), self.chat_scheduler_loop)
-        return future.result()
+        result = future.result()
+        
+        return result
+
+    def abort_requests(self, request_ids_by_address: Dict[str, List[str]]):
+        """Abort multiple requests by their addresses.
+        
+        Args:
+            request_ids_by_address: Dict mapping server address to list of request IDs to abort.
+        """
+        if not request_ids_by_address:
+            return
+        
+        # Create a mapping from address to server index
+        address_to_server_idx = {}
+        for idx, address in enumerate(self.server_addresses):
+            address_to_server_idx[address] = idx
+        
+        # Group abort tasks by server
+        abort_futures = []
+        for address, request_ids in request_ids_by_address.items():
+            if address in address_to_server_idx:
+                server_idx = address_to_server_idx[address]
+                server = self.async_llm_servers[server_idx]
+                for request_id in request_ids:
+                    abort_futures.append(server.abort_request.remote(request_id))
+        
+        if abort_futures:
+            try:
+                # Use return_exceptions=True to prevent one failure from affecting others
+                results = ray.get(abort_futures, timeout=30.0)  # 30 second timeout
+                total_requests = sum(len(ids) for ids in request_ids_by_address.values())
+                logger.info(f"Abort operation completed for {total_requests} requests across {len(request_ids_by_address)} servers")
+            except Exception as e:
+                logger.warning(f"Some abort operations may have failed: {e}")
+                # Don't re-raise - this is not a critical failure
 
 
 def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:

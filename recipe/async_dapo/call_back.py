@@ -23,34 +23,57 @@ class RewardCompletionCallback(CompletionCallback):
         super().__init__(config, scheduler)
         self.max_response_length = config.data.max_response_length
         
+        # 添加并发控制
+        self.max_concurrent_requests = config.get("max_concurrent_requests", 64)  # 默认最大10个并发
+        self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        self.max_retries = config.get("max_retries", 1)  # 最大重试次数
+        self.retry_delay = config.get("retry_delay", 0.5)  # 重试延迟（秒）
+        
         print(f"[Callback] 数据集加载逻辑已移至 math_verify_service.py")
+        print(f"[Callback] 并发限制: {self.max_concurrent_requests}, 最大重试次数: {self.max_retries}")
 
         # TODO: add reward manager to calculate reward score once a sample finish
 
     async def compute_score(self, solution_str, prompt):
-        """调用 math_verify_service.py 中的评分函数计算分数"""
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.post("http://localhost:8000/score", json={
-                    "solution_str": "<think>" + solution_str,
-                    "prompt": prompt,
-                }) as response:
-                    result = await response.json()
-                    
-                    return {
-                        "score": result["score"],
-                        "acc": result["acc"],
-                        "pred": result["pred"]
-                    }
-            
-        except Exception as e:
-            print(f"Error in compute_score: {e}")
-            return {
-                "score": -1.0,
-                "acc": 0.0,
-                "pred": ""
-            }
+        """调用 math_verify_service.py 中的评分函数计算分数，带并发控制和重试机制"""
+        async with self.semaphore:  # 控制并发数量
+            for attempt in range(self.max_retries + 1):
+                try:
+                    import aiohttp
+                    timeout = aiohttp.ClientTimeout(total=30)  # 设置超时时间
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post("http://localhost:8000/score", json={
+                            "solution_str": "<think>" + solution_str,
+                            "prompt": prompt,
+                        }) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                return {
+                                    "score": result["score"],
+                                    "acc": result["acc"],
+                                    "pred": result["pred"]
+                                }
+                            else:
+                                logger.warning(f"HTTP {response.status}: {await response.text()}")
+                
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1}/{self.max_retries + 1} failed: {e}")
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self.retry_delay * (2 ** attempt))  # 指数退避
+                    else:
+                        logger.error(f"All attempts failed for compute_score: {e}")
+                        return {
+                            "score": -1.0,
+                            "acc": 0.0,
+                            "pred": ""
+                        }
+        
+        # 如果所有重试都失败了
+        return {
+            "score": -1.0,
+            "acc": 0.0,
+            "pred": ""
+        }
 
     async def __call__(self, messages: List[Dict[str, str]], completions: ChatCompletion, info: Dict[str, Any]):
         message = completions.choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
