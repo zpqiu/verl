@@ -259,7 +259,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     with marked_timer("gen", timing_raw, "red"):
                         needed_valid_prompt_num = self.config.data.train_batch_size
                         if batch:
-                            needed_valid_prompt_num -= len(batch)
+                            needed_valid_prompt_num -= (len(batch) // self.config.actor_rollout_ref.rollout.n)
                         print(f"[DEBUG] needed_valid_prompt_num: {needed_valid_prompt_num}")
                         gen_batch.meta_info["needed_valid_prompt_num"] = needed_valid_prompt_num
 
