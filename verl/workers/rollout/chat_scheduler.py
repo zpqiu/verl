@@ -17,6 +17,7 @@ import importlib
 import itertools
 import json
 import logging
+import random
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
@@ -256,6 +257,7 @@ class ChatCompletionScheduler:
         server_addresses: List[str],
         max_cache_size: int = 16384,
         abort_callback: callable = None,
+        get_load_callback: callable = None,
     ):
         """
         Args:
@@ -271,12 +273,16 @@ class ChatCompletionScheduler:
         # Least requests load balancing
         self.weighted_addresses = [[0, address] for address in server_addresses]
         heapq.heapify(self.weighted_addresses)
+        self.server_addresses = server_addresses
 
         # LRU cache to map request_id to address
         self.request_id_to_address = LRUCache(maxsize=max_cache_size)
 
         # Callback for immediate request abortion
         self.abort_callback = abort_callback
+
+        # Callback for getting load of each server
+        self.get_load_callback = get_load_callback
 
         self.background_tasks = set()
         if self.config.multi_turn.completion_callback is None:
@@ -287,14 +293,21 @@ class ChatCompletionScheduler:
             module = importlib.import_module(module_path)
             self.completion_callback = getattr(module, class_name)(config, self)
 
-    def submit_chat_completions(self, *, messages: List[Dict[str, str]], request_id: str, info: Dict[str, Any]):
+    def submit_chat_completions(self, *, messages: List[Dict[str, str]], request_id: str, info: Dict[str, Any], address: str = None):
         """Submit chat completion request without wait, completion_callback will be called when the request is done.
 
         Args:
             messages: List of messages.
             request_id: Request id.
             info: Any other auxiliary information pass across multi-turn.
+            address: Optional specific server address. If None, will randomly select from available servers.
         """
+        # If no specific address provided, randomly select one
+        if address is None:
+            address = random.choice(self.server_addresses)
+        
+        # Store the selected address in info for later use
+        info["__selected_address__"] = address
         info["__depth__"] += 1
         task = asyncio.create_task(self._submit_chat_completions_and_callback(messages, request_id, info))
 
@@ -309,11 +322,15 @@ class ChatCompletionScheduler:
         info: Dict[str, Any],
     ):
         """Submit chat completion request, wait request finish and do callback."""
-        if request_id:
+        # Check if a specific address was pre-selected
+        if "__selected_address__" in info:
+            address = info.pop("__selected_address__")
+        elif request_id:
             request_id = request_id.removeprefix("chatcmpl-")
             assert request_id in self.request_id_to_address
             address = self.request_id_to_address.pop(request_id)
         else:
+            # Fallback to load balancing (legacy behavior)
             address = self.weighted_addresses[0][1]
             self.weighted_addresses[0][0] += 1
             heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
@@ -359,10 +376,6 @@ class ChatCompletionScheduler:
         # No more ongoing completion requests
         if info["__depth__"] == 0:
             info["__done__"].set()
-
-    async def _chat_completions_openai(self, address: str, **chat_complete_request) -> ChatCompletion:
-        client = AsyncOpenAI(base_url=f"http://{address}/v1", api_key="token-abc123", timeout=None, max_retries=0)
-        return await client.chat.completions.create(**chat_complete_request)
 
     async def _chat_completions_aiohttp(self, address: str, **chat_complete_request) -> ChatCompletion:
         session = None
@@ -428,7 +441,7 @@ class ChatCompletionScheduler:
         # validation dataset has already been repeated in `PPOTrainer._validate`.
         is_validation = batch.meta_info.get("validate", False)
         n = 1 if is_validation else self.config.n
-        tasks, batch_conversations = [], [None] * len(batch) * n
+        batch_conversations = [None] * len(batch) * n
         
         # 早停配置，验证模式下关闭早停机制
         if is_validation:
@@ -443,39 +456,51 @@ class ChatCompletionScheduler:
         task_request_ids = {}  # {task_index: request_id}
         task_server_addresses = {}  # {task_index: server_address}
         
-        # 统计任务创建的耗时
-        t_task_creation_start = time.time()
+        # 初始化批次对话
         for batch_index, conversation in enumerate(batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0)):
-            # raw_prompt: [{"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
             batch_conversations[batch_index] = conversation.tolist()
-
-            prompt_index = batch_index // n  # 计算这个任务属于哪个原始 prompt
-            task_offset = batch_index % n    # 计算这是该 prompt 的第几个任务
-            
-            task = asyncio.create_task(
-                self._submit_chat_completions_semaphore(
-                    messages=batch_conversations[batch_index],
-                    request_id=None,
-                    sampling_params=kwargs,
-                    task_index=batch_index,
-                    task_request_ids=task_request_ids,
-                    task_server_addresses=task_server_addresses,
-                )
-            )
-            # 为任务添加索引信息，用于早停时识别对应的对话和 prompt
-            task._task_index = batch_index
-            task._prompt_index = prompt_index
-            task._task_offset = task_offset
-            tasks.append(task)
         
-        t_task_creation_time = time.time() - t_task_creation_start
-        print(f"[ChatCompletionScheduler] Task creation time: {t_task_creation_time:.4f}s for {len(tasks)} tasks")
-
-        # 使用基于合法 prompt 的早停逻辑等待任务完成
-        num_prompts = len(batch)
-        completed_prompts, valid_prompts, valid_prompt_indices, cancelled_request_ids_by_address = await self._wait_with_prompt_based_early_stop(
-            tasks, batch_conversations, n, num_prompts, min_valid_prompts, task_request_ids, task_server_addresses, is_validation, self
+        # 创建任务队列和相关的同步对象
+        task_queue = asyncio.Queue()
+        task_creation_done = asyncio.Event()
+        early_stop_signal = asyncio.Event()  # 早停信号
+        
+        # 启动动态任务创建器
+        task_creator = asyncio.create_task(
+            self._dynamic_task_creator(
+                batch_conversations=batch_conversations,
+                sampling_params=kwargs,
+                n=n,
+                task_request_ids=task_request_ids,
+                task_server_addresses=task_server_addresses,
+                task_queue=task_queue,
+                task_creation_done=task_creation_done,
+                early_stop_signal=early_stop_signal,
+            )
         )
+        
+        # 使用动态任务管理器等待任务完成
+        num_prompts = len(batch)
+        completed_prompts, valid_prompts, valid_prompt_indices, cancelled_request_ids_by_address = await self._wait_with_dynamic_task_creation(
+            task_queue=task_queue,
+            task_creation_done=task_creation_done,
+            early_stop_signal=early_stop_signal,
+            batch_conversations=batch_conversations,
+            n=n,
+            num_prompts=num_prompts,
+            min_valid_prompts=min_valid_prompts,
+            task_request_ids=task_request_ids,
+            task_server_addresses=task_server_addresses,
+            is_validation=is_validation,
+        )
+        
+        # 确保任务创建器完成
+        if not task_creator.done():
+            task_creator.cancel()
+            try:
+                await task_creator
+            except asyncio.CancelledError:
+                pass
         
         if is_validation:
             print(f"[ChatCompletionScheduler] Validation completed: {completed_prompts}/{num_prompts} prompts processed")
@@ -501,32 +526,26 @@ class ChatCompletionScheduler:
             output_batch = self.completion_callback.postprocess(batch, batch_conversations, n=n)
             output_batch.meta_info["valid_prompt_indices"] = list(range(num_prompts))
             output_batch.meta_info["need_filtering"] = False
+        
         output_batch.meta_info["timing"] = {
             "generate_sequences": time.time() - t_start,
-            "task_creation": t_task_creation_time
         }
         output_batch.meta_info["completed_prompts"] = completed_prompts
         output_batch.meta_info["valid_prompts"] = valid_prompts
         output_batch.meta_info["total_prompts"] = num_prompts
-        output_batch.meta_info["completed_tasks"] = completed_prompts * n + (len(tasks) - completed_prompts * n) if completed_prompts < num_prompts else len(tasks)
-        output_batch.meta_info["total_tasks"] = len(tasks)
-        # 注意：数据还未真正过滤，只是标记了哪些 prompt 是合法的
         output_batch.meta_info["original_prompts"] = num_prompts
-        output_batch.meta_info["original_tasks"] = len(tasks)
-        # 添加被取消的 request_id 信息
         output_batch.meta_info["cancelled_request_ids_by_address"] = cancelled_request_ids_by_address
         print("[ChatCompletionScheduler] generate_sequences done")
         return output_batch
 
-    async def _wait_with_prompt_based_early_stop(self, tasks: List[asyncio.Task], 
-                                               batch_conversations: List[List[Dict[str, str]]], n: int, num_prompts: int,
-                                               min_valid_prompts: int, task_request_ids: Dict[int, str], task_server_addresses: Dict[int, str],
-                                               is_validation: bool = False, scheduler: 'ChatCompletionScheduler' = None) -> tuple[int, int, set, dict]:
+    async def _wait_with_dynamic_task_creation(self, task_queue: asyncio.Queue, task_creation_done: asyncio.Event, early_stop_signal: asyncio.Event, batch_conversations: List[List[Dict[str, str]]], n: int, num_prompts: int, min_valid_prompts: int, task_request_ids: Dict[int, str], task_server_addresses: Dict[int, str], is_validation: bool = False) -> tuple[int, int, set, dict]:
         """
-        等待任务完成，基于合法 prompt 数量的早停功能
+        等待任务完成，基于合法 prompt 数量的早停功能，支持动态任务创建
         
         Args:
-            tasks: 异步任务列表
+            task_queue: 任务队列
+            task_creation_done: 任务创建完成信号
+            early_stop_signal: 早停信号
             batch_conversations: 对话列表，用于为未完成任务提供默认值
             n: 每个输入prompt的生成数量
             num_prompts: 总的 prompt 数量
@@ -534,7 +553,6 @@ class ChatCompletionScheduler:
             task_request_ids: 任务索引到request_id的映射
             task_server_addresses: 任务索引到server_address的映射
             is_validation: 是否为验证模式
-            scheduler: ChatCompletionScheduler实例，用于调用abort_callback
             
         Returns:
             (实际完成的 prompt 数量, 合法的 prompt 数量, 合法的 prompt 索引集合, 被取消的 request_id 集合)
@@ -545,13 +563,40 @@ class ChatCompletionScheduler:
         valid_prompt_indices = set()
         completed_prompts = 0
         valid_prompts = 0
-        pending_tasks = set(tasks)
+        pending_tasks = set()
         # 收集被取消的 request_id 按地址分组
         cancelled_request_ids_by_address = {}
         
         try:
-            # 验证模式下等待所有任务完成，训练模式下基于合法 prompt 数量早停
-            while pending_tasks and (is_validation or valid_prompts < min_valid_prompts):
+            # 动态管理任务：既要从队列获取新任务，也要等待现有任务完成
+            while not task_creation_done.is_set() or pending_tasks or not task_queue.empty():
+                # 检查是否达到早停条件（仅训练模式）
+                if not is_validation and valid_prompts >= min_valid_prompts:
+                    print(f"[EarlyStop] 达到早停条件：{valid_prompts}/{min_valid_prompts} 合法 prompts")
+                    early_stop_signal.set()  # 设置早停信号，通知任务创建器停止创建新任务
+                    break
+                
+                # 从队列获取新任务（非阻塞）
+                new_tasks_added = 0
+                while not task_queue.empty():
+                    try:
+                        task = task_queue.get_nowait()
+                        pending_tasks.add(task)
+                        new_tasks_added += 1
+                    except asyncio.QueueEmpty:
+                        break
+                
+                if new_tasks_added > 0:
+                    print(f"[TaskManager] 添加了 {new_tasks_added} 个新任务，当前待处理任务数：{len(pending_tasks)}")
+                
+                # 如果没有待处理任务，等待新任务或任务创建完成
+                if not pending_tasks:
+                    if not task_creation_done.is_set():
+                        await asyncio.sleep(0.1)  # 短暂等待新任务
+                        continue
+                    else:
+                        break  # 任务创建完成且无待处理任务
+                
                 # 等待至少一个任务完成
                 done_tasks, pending_tasks = await asyncio.wait(
                     pending_tasks, return_when=asyncio.FIRST_COMPLETED
@@ -596,8 +641,27 @@ class ChatCompletionScheduler:
                             self._provide_default_conversation(batch_conversations, task_index)
             
             # 如果达到早停条件，取消剩余任务（验证模式下不会早停）
-            if pending_tasks and not is_validation and valid_prompts >= min_valid_prompts:
-                print(f"[EarlyStop] 达到早停条件，取消剩余 {len(pending_tasks)} 个任务")
+            if not is_validation and valid_prompts >= min_valid_prompts and (pending_tasks or not task_queue.empty()):
+                print(f"[EarlyStop] 达到早停条件，取消剩余任务")
+                
+                # 设置早停信号，确保任务创建器停止
+                early_stop_signal.set()
+                
+                # 取消队列中尚未开始的任务
+                cancelled_from_queue = 0
+                while not task_queue.empty():
+                    try:
+                        task = task_queue.get_nowait()
+                        task.cancel()
+                        task_index = getattr(task, '_task_index', None)
+                        if task_index is not None:
+                            self._provide_default_conversation(batch_conversations, task_index)
+                        cancelled_from_queue += 1
+                    except asyncio.QueueEmpty:
+                        break
+                
+                if cancelled_from_queue > 0:
+                    print(f"[EarlyStop] 从队列中取消了 {cancelled_from_queue} 个尚未开始的任务")
                 
                 # 收集被取消任务的 request_id 和 server address
                 for task in pending_tasks:
@@ -610,9 +674,6 @@ class ChatCompletionScheduler:
                             if server_address not in cancelled_request_ids_by_address:
                                 cancelled_request_ids_by_address[server_address] = []
                             cancelled_request_ids_by_address[server_address].append(request_id)
-                
-                # Wait longer for abort operations to complete
-                # await asyncio.sleep(0.3)
                 
                 # 取消所有待处理的任务
                 for task in pending_tasks:
@@ -635,12 +696,12 @@ class ChatCompletionScheduler:
                     logger.exception(f"[EarlyStop] 任务清理过程中发生错误: {e}")
                 
                 # 立即abort服务器端请求（在取消客户端任务之前）
-                if cancelled_request_ids_by_address and scheduler and hasattr(scheduler, 'abort_callback') and scheduler.abort_callback:
+                if cancelled_request_ids_by_address and self.abort_callback and callable(self.abort_callback):
                     print(f"[EarlyStop] 立即abort {sum(len(ids) for ids in cancelled_request_ids_by_address.values())} 个服务器端请求")
                     try:
                         # Run abort in a separate thread to avoid blocking the event loop
                         def abort_in_thread():
-                            scheduler.abort_callback(cancelled_request_ids_by_address)
+                            self.abort_callback(cancelled_request_ids_by_address)
                         
                         import threading
                         abort_thread = threading.Thread(target=abort_in_thread, daemon=True)
@@ -654,6 +715,9 @@ class ChatCompletionScheduler:
                 # 额外等待时间，确保服务器端操作完成
                 print("[EarlyStop] 等待服务器端操作完成...")
                 await asyncio.sleep(2.0)  # 给服务器端额外的清理时间
+                
+                # 清空待处理任务集合
+                pending_tasks = set()
             else:
                 # 等待所有剩余任务完成
                 if pending_tasks:
@@ -677,17 +741,140 @@ class ChatCompletionScheduler:
                                     valid_prompt_indices.add(prompt_index)
                     
         except Exception as e:
-            logger.exception(f"Error in _wait_with_prompt_based_early_stop: {e}")
+            logger.exception(f"Error in _wait_with_dynamic_task_creation: {e}")
+            # 设置早停信号，确保任务创建器停止
+            early_stop_signal.set()
             # 确保所有任务都被取消
             for task in pending_tasks:
                 task.cancel()
                 task_index = getattr(task, '_task_index', None)
                 if task_index is not None:
                     self._provide_default_conversation(batch_conversations, task_index)
+            # 也要取消队列中的任务
+            while not task_queue.empty():
+                try:
+                    task = task_queue.get_nowait()
+                    task.cancel()
+                except asyncio.QueueEmpty:
+                    break
             raise
             
         return completed_prompts, valid_prompts, valid_prompt_indices, cancelled_request_ids_by_address
-    
+
+    async def _dynamic_task_creator(self, batch_conversations: List[List[Dict[str, str]]], sampling_params: Dict[str, Any], n: int, task_request_ids: Dict[int, str], task_server_addresses: Dict[int, str], task_queue: asyncio.Queue, task_creation_done: asyncio.Event, early_stop_signal: asyncio.Event):
+        """
+        动态任务创建器：根据服务器负载情况分批次创建任务
+        
+        Args:
+            batch_conversations: 批次对话列表
+            sampling_params: 采样参数
+            n: 每个 prompt 的回复数量
+            task_request_ids: 任务索引到request_id的映射
+            task_server_addresses: 任务索引到server_address的映射
+            task_queue: 任务队列
+            task_creation_done: 任务创建完成信号
+            early_stop_signal: 早停信号
+        """
+        try:
+            total_tasks = len(batch_conversations)
+            created_tasks = 0
+            
+            # 默认配置
+            batch_creation_interval = getattr(self.config, 'batch_creation_interval', 10)  # 批次创建间隔（秒）
+            max_concurrent_per_server = getattr(self.config, 'max_concurrent_per_server', 512)  # 每个服务器最大并发数
+            
+            print(f"[TaskCreator] 开始动态创建 {total_tasks} 个任务")
+            print(f"[TaskCreator] 配置：batch_creation_interval={batch_creation_interval}, max_concurrent_per_server={max_concurrent_per_server}")
+            
+            while created_tasks < total_tasks:
+                # 检查早停信号
+                if early_stop_signal.is_set():
+                    print(f"[TaskCreator] 收到早停信号，停止创建任务。已创建 {created_tasks}/{total_tasks} 个任务")
+                    break
+                
+                # 第一步：调用 get_load_callback 获取所有服务的负载情况
+                server_loads = {}
+                if self.get_load_callback and callable(self.get_load_callback):
+                    try:
+                        server_loads = await self.get_load_callback()
+                        print(f"[TaskCreator] 获取服务器负载情况：{server_loads}")
+                    except Exception as e:
+                        print(f"[TaskCreator] Error calling get_load_callback: {e}")
+                        # 如果获取负载失败，使用默认策略
+                        server_loads = {}
+                
+                # 第二步：计算每个服务器可以接收的新任务数量
+                server_capacities = {}
+                for address in self.server_addresses:
+                    current_load = server_loads.get(address, 0)
+                    available_capacity = max(0, max_concurrent_per_server - current_load)
+                    server_capacities[address] = available_capacity
+                
+                total_capacity = sum(server_capacities.values())
+                print(f"[TaskCreator] 服务器容量情况：{server_capacities}，总容量：{total_capacity}")
+                
+                # 第三步：根据容量分配任务
+                if total_capacity > 0:
+                    # 按比例分配任务给各个服务器
+                    tasks_to_create = min(total_capacity, total_tasks - created_tasks)
+                    
+                    for address, capacity in server_capacities.items():
+                        if capacity > 0 and created_tasks < total_tasks:
+                            # 为这个服务器创建任务
+                            tasks_for_this_server = min(
+                                capacity,
+                                int(tasks_to_create * capacity / total_capacity) + 1,
+                                total_tasks - created_tasks
+                            )
+                            
+                            for _ in range(tasks_for_this_server):
+                                if created_tasks >= total_tasks:
+                                    break
+                                    
+                                batch_index = created_tasks
+                                conversation = batch_conversations[batch_index]
+                                prompt_index = batch_index // n
+                                task_offset = batch_index % n
+                                
+                                # 创建任务，但指定使用特定的服务器地址
+                                task = asyncio.create_task(
+                                    self._submit_chat_completions_semaphore(
+                                        messages=conversation,
+                                        request_id=None,
+                                        sampling_params=sampling_params,
+                                        task_index=batch_index,
+                                        task_request_ids=task_request_ids,
+                                        task_server_addresses=task_server_addresses,
+                                        address=address,
+                                    )
+                                )
+                                
+                                # 为任务添加索引信息
+                                task._task_index = batch_index
+                                task._prompt_index = prompt_index
+                                task._task_offset = task_offset
+                                
+                                await task_queue.put(task)
+                                created_tasks += 1
+                                
+                                # print(f"[TaskCreator] 创建任务 {created_tasks}/{total_tasks} 到服务器 {address}")
+                    
+                    print(f"[TaskCreator] 本轮创建了 {tasks_to_create} 个任务，总进度：{created_tasks}/{total_tasks}")
+                else:
+                    print("[TaskCreator] 所有服务器都已满载，等待...")
+                
+                # 第四步：如果还有任务需要创建，等待一段时间
+                if created_tasks < total_tasks:
+                    await asyncio.sleep(batch_creation_interval)
+            
+            print(f"[TaskCreator] 完成所有 {total_tasks} 个任务的创建")
+            task_creation_done.set()
+            
+        except Exception as e:
+            logger.exception(f"Error in _dynamic_task_creator: {e}")
+            task_creation_done.set()  # 即使出错也要设置完成信号
+            raise
+
     def _filter_invalid_prompts(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], 
                                valid_prompt_indices: set, n: int, num_prompts: int) -> tuple[DataProto, List[List[Dict[str, str]]], int]:
         """
@@ -720,44 +907,7 @@ class ChatCompletionScheduler:
             
             # 3. 处理 batch 数据的过滤
             filtered_batch = batch.select_idxs(sorted_valid_prompt_indices)
-            # if batch.batch is not None and len(batch.batch) > 0:
-            #     # 获取第一个张量来确定批次大小
-            #     first_tensor_key = list(batch.batch.keys())[0]
-            #     first_tensor_shape = batch.batch[first_tensor_key].shape[0]
-                
-            #     if first_tensor_shape == num_prompts:
-            #         # 如果张量数据是按 prompt 组织的，使用 prompt 索引
-            #         filtered_batch = batch.select_idxs(sorted_valid_prompt_indices)
-            #     elif first_tensor_shape == num_prompts * n:
-            #         # 如果张量数据是按任务组织的，使用任务索引
-            #         filtered_batch = batch.select_idxs(task_indices)
-            #     else:
-            #         # 其他情况，保持原始数据
-            #         logger.warning(f"Unexpected batch tensor shape: {first_tensor_shape}, expected {num_prompts} or {num_prompts * n}")
-            #         filtered_batch = batch
-            # else:
-            #     # 如果没有 batch 数据，手动处理 non_tensor_batch
-            #     filtered_non_tensor_batch = {}
-            #     for key, values in batch.non_tensor_batch.items():
-            #         if hasattr(values, '__len__') and len(values) > 0:
-            #             if key == "raw_prompt" or len(values) == num_prompts:
-            #                 # 按 prompt 索引过滤
-            #                 filtered_non_tensor_batch[key] = values[sorted_valid_prompt_indices]
-            #             elif len(values) == num_prompts * n:
-            #                 # 按任务索引过滤
-            #                 filtered_non_tensor_batch[key] = values[task_indices]
-            #             else:
-            #                 # 其他情况保持不变
-            #                 filtered_non_tensor_batch[key] = values
-            #         else:
-            #             filtered_non_tensor_batch[key] = values
-                
-            #     filtered_batch = DataProto(
-            #         batch=None,
-            #         non_tensor_batch=filtered_non_tensor_batch,
-            #         meta_info=batch.meta_info.copy()
-            #     )
-            
+
             return filtered_batch, filtered_conversations, n
             
         except Exception as e:
@@ -850,10 +1000,8 @@ class ChatCompletionScheduler:
                 {"role": "assistant", "content": "", "score": 0.0, "acc": 0.0, "pred": ""}
             ]
 
-    async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, 
-                                               sampling_params: Dict[str, Any], task_index: int = None,
-                                               task_request_ids: Dict[int, str] = None, 
-                                               task_server_addresses: Dict[int, str] = None):
+    async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, sampling_params: Dict[str, Any], task_index: int, task_request_ids: Dict[int, str], task_server_addresses: Dict[int, str], address: str=None):
+        """Submit chat completion request to a specific server and wait for completion"""
         done = asyncio.Event()
 
         info = {
@@ -865,7 +1013,8 @@ class ChatCompletionScheduler:
             "__task_server_addresses__": task_server_addresses,
         }
 
-        self.submit_chat_completions(messages=messages, request_id=request_id, info=info)
+        # Use the unified submit_chat_completions method with specific address
+        self.submit_chat_completions(messages=messages, request_id=request_id, info=info, address=address)
 
         # Wait until all completion requests are done
         await done.wait()

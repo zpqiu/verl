@@ -279,3 +279,6 @@ class AsyncvLLMServer(AsyncServerBase):
             # Don't let abort failures crash the server - log as warning instead of error
             logger.warning(f"Failed to abort request {request_id}, ignoring error: {e}")
             # Don't re-raise the exception to avoid cascading failures
+
+    async def get_num_unfinished_requests(self):
+        return self.engine.output_processor.get_num_unfinished_requests()

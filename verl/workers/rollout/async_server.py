@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+import random
 import socket
 import threading
 from abc import ABC, abstractmethod
@@ -176,6 +177,7 @@ class AsyncLLMServerManager:
                 config=self.full_config,
                 server_addresses=self.server_addresses,
                 abort_callback=self.abort_requests,
+                get_load_callback=self.get_num_unfinished_requests,
             )
         except Exception as e:
             logger.exception(f"chat_scheduler init error: {e}")
@@ -254,6 +256,10 @@ class AsyncLLMServerManager:
             except Exception as e:
                 logger.warning(f"Some abort operations may have failed: {e}")
                 # Don't re-raise - this is not a critical failure
+
+    async def get_num_unfinished_requests(self):
+        # 返回 service_address 到 num_unfinished_requests 的映射
+        return {address: ray.get(server.get_num_unfinished_requests.remote()) for address, server in zip(self.server_addresses, self.async_llm_servers)}
 
 
 def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:
