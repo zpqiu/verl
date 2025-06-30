@@ -60,6 +60,15 @@ batch_creation_interval=10
 max_concurrent_per_server=512
 ```
 
+### RewardCompletionCallback 自定义回调
+本实现采用了自定义的`RewardCompletionCallback`来处理生成结果的实时评分：
+
+- **实时评分**: 每当模型完成一个回复生成时，立即调用外部的`math_verify_service`进行数学问题验证和评分
+- **并发控制**: 通过Semaphore限制同时进行的评分请求数量，避免过载外部服务
+- **重试机制**: 支持指数退避的重试策略，提高服务可靠性
+- **评分结果**: 返回score(分数)、accuracy(准确率)和prediction(预测结果)三个维度的评价指标
+- **数据后处理**: 在`postprocess`阶段处理token化、填充和掩码生成等操作
+
 
 ## 🏗️ 架构设计
 
@@ -97,7 +106,7 @@ max_concurrent_per_server=512
 graph TD
     A["AsyncLLMServerManager.generate_sequences()<br/>主入口"] --> B["ChatCompletionScheduler.generate_sequences()"]
     
-    B --> C["初始化配置<br/>- 采样参数<br/>- 早停阈值<br/>- 任务队列"]
+    B --> C["初始化配置<br/>- 采样参数<br/>- 早停阈值<br/>- 任务队列<br/>- RewardCompletionCallback"]
     
     C --> D["创建任务管理组件"]
     D --> E["任务队列 (asyncio.Queue)"]
@@ -120,71 +129,62 @@ graph TD
     I --> R["从队列获取新任务"]
     R --> S["等待任务完成<br/>(asyncio.wait FIRST_COMPLETED)"]
     S --> T["检查任务结果"]
-    T --> U["更新prompt完成状态"]
-    U --> V{"验证模式?"}
+    T --> LL["RewardCompletionCallback处理<br/>调用math_verify_service评分"]
+    LL --> XX["更新prompt完成状态"]
     
-    V -->|是| W["所有完成的prompt都合法"]
-    V -->|否| X["检查分数方差<br/>(_check_prompt_score_variance)"]
-    X --> Y{"方差 > 1e-8?"}
-    Y -->|是| Z["标记为合法prompt"]
-    Y -->|否| AA["标记为非法prompt"]
+    XX --> YY{"Eval模式?"}
+    YY -->|是| ZZ["所有完成的prompt都合法"]
+    YY -->|否| AAA["检查分数方差<br/>(_check_prompt_score_variance)"]
+    AAA --> BBB{"方差 > 1e-8?"}
+    BBB -->|是| CCC["标记为合法prompt"]
+    BBB -->|否| DDD["标记为非法prompt"]
     
-    W --> BB["更新合法prompt计数"]
-    Z --> BB
-    AA --> BB
+    ZZ --> EEE["更新合法prompt计数"]
+    CCC --> EEE
+    DDD --> EEE
     
-    BB --> CC{"合法prompt数 >= 最少需要数?"}
-    CC -->|是,非验证模式| DD["触发早停"]
-    CC -->|否| EE["继续等待更多任务"]
+    EEE --> FFF{"合法prompt数 >= Train batch size?"}
+    FFF -->|是,非Eval模式| GGG["触发早停"]
+    FFF -->|否| HHH["继续等待更多任务"]
     
-    DD --> FF["设置早停信号"]
-    FF --> GG["取消队列中未开始任务"]
-    GG --> HH["取消正在进行的任务"]
-    HH --> II["收集被取消的request_id"]
-    II --> JJ["调用abort_callback<br/>中断服务器端请求"]
-    JJ --> KK["等待任务清理完成"]
+    GGG --> III["设置早停信号"]
+    III --> KKK["在调用端取消未开始和进行中的任务"]
+    KKK --> LLL["收集被取消的request_id"]
+    LLL --> MMM["调用abort_callback<br/>中断服务器端请求"]
+    MMM --> NNN["等待任务清理完成"]
     
-    EE --> R
+    HHH --> R
     
-    M --> LL["ToolCompletionCallback处理"]
-    LL --> MM{"工具调用?"}
-    MM -->|是| NN["执行工具"]
-    NN --> OO["重新提交聊天请求"]
-    OO --> LL
-    MM -->|否| PP["对话完成"]
+    FFF -->|Eval模式| OOO["等待所有任务完成"]
+    OOO --> PPP["RewardCompletionCallback.postprocess()"]
+    NNN --> PPP
     
-    CC -->|验证模式| QQ["等待所有任务完成"]
-    QQ --> RR["后处理数据"]
-    KK --> RR
-    PP --> RR
+    PPP --> QQQ["处理批次对话数据"]
+    QQQ --> RRR["提取响应和评分"]
+    RRR --> SSS["Token化处理<br/>- prompt左填充<br/>- response右填充"]
+    SSS --> TTT["生成attention_mask和position_ids"]
+    TTT --> UUU["过滤非法prompt数据<br/>(_filter_invalid_prompts)"]
+    UUU --> VVV["返回DataProto结果<br/>包含评分统计信息"]
     
-    RR --> SS["过滤非法prompt数据<br/>(_filter_invalid_prompts)"]
-    SS --> TT["ToolCompletionCallback.postprocess<br/>处理token化和掩码"]
-    TT --> UU["返回DataProto结果<br/>包含统计信息"]
-    
-    subgraph "服务器管理"
-        VV["AsyncLLMServerManager"]
-        WW["多个AsyncvLLMServer实例"]
-        XX["负载均衡策略"]
-        YY["请求路由"]
+    subgraph "自定义回调处理"
+        WWW["RewardCompletionCallback<br/>实时评分和数据处理"]
     end
     
-    subgraph "工具调用流程"
-        ZZ["检测tool_calls"]
-        AAA["并行执行工具"]
-        BBB["收集工具响应"]
-        CCC["重新提交请求"]
+    subgraph "外部服务"
+        CCCC["math_verify_service.py<br/>(localhost:8000/score)"]
     end
     
     subgraph "早停优化"
-        DDD["基于分数方差判断"]
-        EEE["动态任务创建"]
-        FFF["服务器负载感知"]
-        GGG["请求中断机制"]
+        DDDD["基于分数方差判断有效Prompt"]
+        EEEE["根据服务负载动态创建任务"]
+        FFFF["中断机制"]
     end
     
     style A fill:#ff9999
-    style DD fill:#ffcc99
-    style JJ fill:#99ccff
-    style UU fill:#99ff99
+    style LL fill:#ffcc99
+    style GGG fill:#ffcc99
+    style MMM fill:#99ccff
+    style VVV fill:#99ff99
+    style WWW fill:#ff99cc
+    style CCCC fill:#99ff99
 ```
