@@ -937,17 +937,25 @@ class ChatCompletionScheduler:
                     conversation = batch_conversations[task_index]
                     if len(conversation) > 0:
                         # 找到最后一个 assistant 回复
+                        found_valid_assistant = False
                         for message in reversed(conversation):
                             if message.get("role") == "assistant" and "score" in message:
                                 scores.append(float(message["score"]))
+                                found_valid_assistant = True
                                 break
-                        else:
-                            # 如果没找到带分数的 assistant 回复，使用默认分数 0.0
-                            scores.append(0.0)
+                        
+                        # 如果没找到带分数的 assistant 回复，说明这是一个非法 conversation
+                        if not found_valid_assistant:
+                            logger.debug(f"Prompt {prompt_index}, task {task_offset}: 没有找到有效的 assistant 回复")
+                            return False  # 存在非法 conversation，整个 prompt 无效
                     else:
-                        scores.append(0.0)
+                        # conversation 为空，非法
+                        logger.debug(f"Prompt {prompt_index}, task {task_offset}: conversation 为空")
+                        return False
                 else:
-                    scores.append(0.0)
+                    # conversation 不存在或为 None，非法
+                    logger.debug(f"Prompt {prompt_index}, task {task_offset}: conversation 不存在")
+                    return False
             
             # 检查是否收集到了 n 个分数
             if len(scores) != n:

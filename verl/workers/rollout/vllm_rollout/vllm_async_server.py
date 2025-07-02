@@ -249,6 +249,9 @@ class AsyncvLLMServer(AsyncServerBase):
         while self.engine.output_processor.has_unfinished_requests():
             running_request_ids = [x for x in self.engine.output_processor.request_states]
             print(f"[DEBUG] Running request ids: {running_request_ids[:10]}")
+            for request_id in running_request_ids:
+                await self.engine.abort(request_id)
+            self.engine.output_processor.abort_requests(running_request_ids)
             print(f"Waiting for engine to finish or cancel {self.engine.output_processor.get_num_unfinished_requests()} requests...")
             await asyncio.sleep(0.1)
         end_time = time.time()
