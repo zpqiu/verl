@@ -323,14 +323,15 @@ class ChatCompletionScheduler:
     ):
         """Submit chat completion request, wait request finish and do callback."""
         # Check if a specific address was pre-selected
+        address = None
         if "__selected_address__" in info:
             address = info.pop("__selected_address__")
         elif request_id:
             request_id = request_id.removeprefix("chatcmpl-")
-            assert request_id in self.request_id_to_address
-            address = self.request_id_to_address.pop(request_id)
-        else:
-            # Fallback to load balancing (legacy behavior)
+            if request_id in self.request_id_to_address:
+                address = self.request_id_to_address.pop(request_id)
+        # Fallback to load balancing (legacy behavior)
+        if address is None:
             address = self.weighted_addresses[0][1]
             self.weighted_addresses[0][0] += 1
             heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
@@ -506,6 +507,11 @@ class ChatCompletionScheduler:
             print(f"[ChatCompletionScheduler] Validation completed: {completed_prompts}/{num_prompts} prompts processed")
         else:
             print(f"[ChatCompletionScheduler] Early stop triggered: {completed_prompts}/{num_prompts} prompts completed, {valid_prompts} valid prompts")
+            
+            # 在训练模式下，应用 FIFO 选择原则
+            if len(valid_prompt_indices) > min_valid_prompts:
+                valid_prompt_indices = self._apply_fifo_selection(valid_prompt_indices, min_valid_prompts)
+                valid_prompts = len(valid_prompt_indices)
         
         # 在 chat_scheduler 中进行过滤，同时返回合法索引给调用方
         if not is_validation and len(valid_prompt_indices) < num_prompts:
@@ -571,10 +577,16 @@ class ChatCompletionScheduler:
             # 动态管理任务：既要从队列获取新任务，也要等待现有任务完成
             while not task_creation_done.is_set() or pending_tasks or not task_queue.empty():
                 # 检查是否达到早停条件（仅训练模式）
-                if not is_validation and valid_prompts >= min_valid_prompts:
-                    print(f"[EarlyStop] 达到早停条件：{valid_prompts}/{min_valid_prompts} 合法 prompts")
-                    early_stop_signal.set()  # 设置早停信号，通知任务创建器停止创建新任务
-                    break
+                # 使用 FIFO 策略：确保选择的 valid prompts 和它们之前的所有 prompts 都已完成
+                if not is_validation:
+                    can_early_stop, early_stop_prefix_length = self._check_fifo_early_stop_condition(
+                        prompt_completion_status, valid_prompt_indices, n, min_valid_prompts
+                    )
+                    if can_early_stop:
+                        print(f"[EarlyStop] 达到 FIFO 早停条件：前 {early_stop_prefix_length} 个 prompts 都已完成，"
+                              f"其中有 {len([i for i in range(early_stop_prefix_length) if i in valid_prompt_indices])} 个合法 prompts (需要 {min_valid_prompts} 个)")
+                        early_stop_signal.set()  # 设置早停信号，通知任务创建器停止创建新任务
+                        break
                 
                 # 从队列获取新任务（非阻塞）
                 new_tasks_added = 0
@@ -640,84 +652,102 @@ class ChatCompletionScheduler:
                         if task_index is not None:
                             self._provide_default_conversation(batch_conversations, task_index)
             
-            # 如果达到早停条件，取消剩余任务（验证模式下不会早停）
-            if not is_validation and valid_prompts >= min_valid_prompts and (pending_tasks or not task_queue.empty()):
-                print(f"[EarlyStop] 达到早停条件，取消剩余任务")
-                
-                # 设置早停信号，确保任务创建器停止
-                early_stop_signal.set()
-                
-                # 取消队列中尚未开始的任务
-                cancelled_from_queue = 0
-                while not task_queue.empty():
-                    try:
-                        task = task_queue.get_nowait()
+            # 检查是否达到 FIFO 早停条件（验证模式下不会早停）
+            if not is_validation:
+                can_early_stop, early_stop_prefix_length = self._check_fifo_early_stop_condition(
+                    prompt_completion_status, valid_prompt_indices, n, min_valid_prompts
+                )
+                if can_early_stop and (pending_tasks or not task_queue.empty()):
+                    print(f"[EarlyStop] 达到 FIFO 早停条件，取消剩余任务")
+                    
+                    # 更新 valid_prompt_indices，按照 FIFO 原则选择前 min_valid_prompts 个合法 prompts
+                    fifo_valid_prompt_indices = []
+                    for i in range(early_stop_prefix_length):
+                        if i in valid_prompt_indices:
+                            fifo_valid_prompt_indices.append(i)
+                            if len(fifo_valid_prompt_indices) >= min_valid_prompts:
+                                break
+                    
+                    valid_prompt_indices = set(fifo_valid_prompt_indices)
+                    valid_prompts = len(valid_prompt_indices)
+                    completed_prompts = early_stop_prefix_length
+                    
+                    print(f"[EarlyStop] FIFO 策略保留前 {early_stop_prefix_length} 个 prompts，按顺序选择前 {valid_prompts} 个合法 prompts (需要 {min_valid_prompts} 个)")
+                    
+                    # 设置早停信号，确保任务创建器停止
+                    early_stop_signal.set()
+                    
+                    # 取消队列中尚未开始的任务
+                    cancelled_from_queue = 0
+                    while not task_queue.empty():
+                        try:
+                            task = task_queue.get_nowait()
+                            task.cancel()
+                            task_index = getattr(task, '_task_index', None)
+                            if task_index is not None:
+                                self._provide_default_conversation(batch_conversations, task_index)
+                            cancelled_from_queue += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    
+                    if cancelled_from_queue > 0:
+                        print(f"[EarlyStop] 从队列中取消了 {cancelled_from_queue} 个尚未开始的任务")
+                    
+                    # 收集被取消任务的 request_id 和 server address
+                    for task in pending_tasks:
+                        task_index = getattr(task, '_task_index', None)
+                        if task_index is not None:
+                            # 收集 request_id 和 server address
+                            if task_index in task_request_ids and task_index in task_server_addresses:
+                                request_id = task_request_ids[task_index]
+                                server_address = task_server_addresses[task_index]
+                                if server_address not in cancelled_request_ids_by_address:
+                                    cancelled_request_ids_by_address[server_address] = []
+                                cancelled_request_ids_by_address[server_address].append(request_id)
+                    
+                    # 取消所有待处理的任务
+                    for task in pending_tasks:
                         task.cancel()
                         task_index = getattr(task, '_task_index', None)
                         if task_index is not None:
                             self._provide_default_conversation(batch_conversations, task_index)
-                        cancelled_from_queue += 1
-                    except asyncio.QueueEmpty:
-                        break
-                
-                if cancelled_from_queue > 0:
-                    print(f"[EarlyStop] 从队列中取消了 {cancelled_from_queue} 个尚未开始的任务")
-                
-                # 收集被取消任务的 request_id 和 server address
-                for task in pending_tasks:
-                    task_index = getattr(task, '_task_index', None)
-                    if task_index is not None:
-                        # 收集 request_id 和 server address
-                        if task_index in task_request_ids and task_index in task_server_addresses:
-                            request_id = task_request_ids[task_index]
-                            server_address = task_server_addresses[task_index]
-                            if server_address not in cancelled_request_ids_by_address:
-                                cancelled_request_ids_by_address[server_address] = []
-                            cancelled_request_ids_by_address[server_address].append(request_id)
-                
-                # 取消所有待处理的任务
-                for task in pending_tasks:
-                    task.cancel()
-                    task_index = getattr(task, '_task_index', None)
-                    if task_index is not None:
-                        self._provide_default_conversation(batch_conversations, task_index)
-                
-                # 等待取消的任务清理完成，使用更短的超时避免无限等待
-                print(f"[EarlyStop] 等待 {len(pending_tasks)} 个被取消任务的清理...")
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*pending_tasks, return_exceptions=True),
-                        timeout=30.0  # 30秒超时
-                    )
-                    print("[EarlyStop] 所有被取消任务已完成清理")
-                except asyncio.TimeoutError:
-                    print("[EarlyStop] 警告：部分任务清理超时，可能存在未完成的服务器端操作")
-                except Exception as e:
-                    logger.exception(f"[EarlyStop] 任务清理过程中发生错误: {e}")
-                
-                # 立即abort服务器端请求（在取消客户端任务之前）
-                if cancelled_request_ids_by_address and self.abort_callback and callable(self.abort_callback):
-                    print(f"[EarlyStop] 立即abort {sum(len(ids) for ids in cancelled_request_ids_by_address.values())} 个服务器端请求")
+                    
+                    # 等待取消的任务清理完成，使用更短的超时避免无限等待
+                    print(f"[EarlyStop] 等待 {len(pending_tasks)} 个被取消任务的清理...")
                     try:
-                        # Run abort in a separate thread to avoid blocking the event loop
-                        def abort_in_thread():
-                            self.abort_callback(cancelled_request_ids_by_address)
-                        
-                        import threading
-                        abort_thread = threading.Thread(target=abort_in_thread, daemon=True)
-                        abort_thread.start()
-                        
-                        # Give abort operations a chance to start
-                        await asyncio.sleep(0.2)
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending_tasks, return_exceptions=True),
+                            timeout=30.0  # 30秒超时
+                        )
+                        print("[EarlyStop] 所有被取消任务已完成清理")
+                    except asyncio.TimeoutError:
+                        print("[EarlyStop] 警告：部分任务清理超时，可能存在未完成的服务器端操作")
                     except Exception as e:
-                        logger.exception(f"Error calling abort_callback: {e}")
+                        logger.exception(f"[EarlyStop] 任务清理过程中发生错误: {e}")
+                    
+                    # 立即abort服务器端请求（在取消客户端任务之前）
+                    if cancelled_request_ids_by_address and self.abort_callback and callable(self.abort_callback):
+                        print(f"[EarlyStop] 立即abort {sum(len(ids) for ids in cancelled_request_ids_by_address.values())} 个服务器端请求")
+                        try:
+                            # Run abort in a separate thread to avoid blocking the event loop
+                            def abort_in_thread():
+                                self.abort_callback(cancelled_request_ids_by_address)
+                            
+                            import threading
+                            abort_thread = threading.Thread(target=abort_in_thread, daemon=True)
+                            abort_thread.start()
+                            
+                            # Give abort operations a chance to start
+                            await asyncio.sleep(0.2)
+                        except Exception as e:
+                            logger.exception(f"Error calling abort_callback: {e}")
 
-                # 额外等待时间，确保服务器端操作完成
-                print("[EarlyStop] 等待服务器端操作完成...")
-                await asyncio.sleep(2.0)  # 给服务器端额外的清理时间
-                
-                # 清空待处理任务集合
-                pending_tasks = set()
+                    # 额外等待时间，确保服务器端操作完成
+                    print("[EarlyStop] 等待服务器端操作完成...")
+                    await asyncio.sleep(2.0)  # 给服务器端额外的清理时间
+                    
+                    # 清空待处理任务集合
+                    pending_tasks = set()
             else:
                 # 等待所有剩余任务完成
                 if pending_tasks:
@@ -813,30 +843,30 @@ class ChatCompletionScheduler:
                 total_capacity = sum(server_capacities.values())
                 print(f"[TaskCreator] 服务器容量情况：{server_capacities}，总容量：{total_capacity}")
                 
-                # 第三步：根据容量分配任务
+                # 第三步：使用 round-robin 方式分配任务
                 if total_capacity > 0:
-                    # 按比例分配任务给各个服务器
                     tasks_to_create = min(total_capacity, total_tasks - created_tasks)
                     
-                    for address, capacity in server_capacities.items():
-                        if capacity > 0 and created_tasks < total_tasks:
-                            # 为这个服务器创建任务
-                            tasks_for_this_server = min(
-                                capacity,
-                                int(tasks_to_create * capacity / total_capacity) + 1,
-                                total_tasks - created_tasks
-                            )
+                    # 创建有容量的服务器地址列表
+                    available_servers = [address for address, capacity in server_capacities.items() if capacity > 0]
+                    
+                    if available_servers:
+                        # 使用 round-robin 方式分配任务
+                        server_index = 0
+                        tasks_created_this_round = 0
+                        
+                        while tasks_created_this_round < tasks_to_create and created_tasks < total_tasks:
+                            # 选择当前服务器
+                            current_server = available_servers[server_index]
                             
-                            for _ in range(tasks_for_this_server):
-                                if created_tasks >= total_tasks:
-                                    break
-                                    
+                            # 检查当前服务器是否还有容量
+                            if server_capacities[current_server] > 0:
                                 batch_index = created_tasks
                                 conversation = batch_conversations[batch_index]
                                 prompt_index = batch_index // n
                                 task_offset = batch_index % n
                                 
-                                # 创建任务，但指定使用特定的服务器地址
+                                # 创建任务，指定使用当前服务器
                                 task = asyncio.create_task(
                                     self._submit_chat_completions_semaphore(
                                         messages=conversation,
@@ -845,7 +875,7 @@ class ChatCompletionScheduler:
                                         task_index=batch_index,
                                         task_request_ids=task_request_ids,
                                         task_server_addresses=task_server_addresses,
-                                        address=address,
+                                        address=current_server,
                                     )
                                 )
                                 
@@ -856,10 +886,23 @@ class ChatCompletionScheduler:
                                 
                                 await task_queue.put(task)
                                 created_tasks += 1
+                                tasks_created_this_round += 1
                                 
-                                # print(f"[TaskCreator] 创建任务 {created_tasks}/{total_tasks} 到服务器 {address}")
+                                # 减少该服务器的剩余容量
+                                server_capacities[current_server] -= 1
+                                
+                                # print(f"[TaskCreator] 创建任务 {created_tasks}/{total_tasks} 到服务器 {current_server}")
+                            
+                            # 轮询到下一个服务器
+                            server_index = (server_index + 1) % len(available_servers)
+                            
+                            # 如果轮询一圈后发现所有服务器都没有容量了，退出循环
+                            if server_index == 0:
+                                remaining_capacity = sum(server_capacities[addr] for addr in available_servers)
+                                if remaining_capacity == 0:
+                                    break
                     
-                    print(f"[TaskCreator] 本轮创建了 {tasks_to_create} 个任务，总进度：{created_tasks}/{total_tasks}")
+                    print(f"[TaskCreator] 本轮使用 round-robin 创建了 {tasks_created_this_round} 个任务，总进度：{created_tasks}/{total_tasks}")
                 else:
                     print("[TaskCreator] 所有服务器都已满载，等待...")
                 
@@ -978,6 +1021,66 @@ class ChatCompletionScheduler:
             logger.exception(f"Error checking score variance for prompt {prompt_index}: {e}")
             return False
     
+    def _check_fifo_early_stop_condition(self, prompt_completion_status: Dict[int, set], 
+                                         valid_prompt_indices: set, n: int, min_valid_prompts: int) -> tuple[bool, int]:
+        """
+        检查基于 FIFO 策略的早停条件
+        
+        找到从 prompt index 0 开始的连续完成前缀，如果在这个前缀中有足够的 valid prompts，
+        则可以进行早停，以保证数据分布的完整性。
+        
+        Args:
+            prompt_completion_status: 每个 prompt 的完成状态
+            valid_prompt_indices: 合法的 prompt 索引集合
+            n: 每个 prompt 的回复数量
+            min_valid_prompts: 最少需要的合法 prompt 数量
+            
+        Returns:
+            (是否可以早停, 连续完成的前缀长度)
+        """
+        # 找到从索引 0 开始的连续完成的前缀
+        continuous_completed_length = 0
+        for prompt_idx in range(len(prompt_completion_status)):
+            if len(prompt_completion_status[prompt_idx]) == n:
+                # 这个 prompt 已完成
+                continuous_completed_length += 1
+            else:
+                # 遇到未完成的 prompt，停止
+                break
+        
+        if continuous_completed_length == 0:
+            return False, 0
+        
+        # 在连续完成的前缀中计算 valid prompts 数量
+        valid_prompts_in_prefix = len([i for i in range(continuous_completed_length) if i in valid_prompt_indices])
+        
+        # 如果前缀中的 valid prompts 数量满足要求，则可以早停
+        can_early_stop = valid_prompts_in_prefix >= min_valid_prompts
+        
+        return can_early_stop, continuous_completed_length
+
+    def _apply_fifo_selection(self, valid_prompt_indices: set, min_valid_prompts: int) -> set:
+        """
+        按照 FIFO 原则选择前 min_valid_prompts 个 valid prompts
+        
+        Args:
+            valid_prompt_indices: 所有合法的 prompt 索引集合
+            min_valid_prompts: 需要的合法 prompt 数量
+            
+        Returns:
+            按顺序选择的 valid prompt 索引集合
+        """
+        if len(valid_prompt_indices) <= min_valid_prompts:
+            return valid_prompt_indices
+        
+        # 按照 prompt index 排序，选择前 min_valid_prompts 个
+        sorted_valid_indices = sorted(list(valid_prompt_indices))
+        selected_indices = sorted_valid_indices[:min_valid_prompts]
+        
+        print(f"[FIFO] 从 {len(valid_prompt_indices)} 个合法 prompts 中按顺序选择前 {len(selected_indices)} 个：{selected_indices}")
+        
+        return set(selected_indices)
+
     def _provide_default_conversation(self, batch_conversations: List[List[Dict[str, str]]], task_index: int):
         """为未完成或失败的任务提供默认对话"""
         if batch_conversations[task_index] is not None and len(batch_conversations[task_index]) > 0:
