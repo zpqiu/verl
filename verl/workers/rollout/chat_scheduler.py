@@ -17,10 +17,11 @@ import importlib
 import itertools
 import json
 import logging
-import random
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 
 import aiohttp
@@ -250,6 +251,183 @@ class ToolCompletionCallback(CompletionCallback):
         return loss_mask
 
 
+@dataclass
+class TaskInfo:
+    """任务信息封装"""
+    task_index: int
+    prompt_index: int
+    task_offset: int
+    server_address: str = ""
+    request_id: Optional[str] = None
+    start_time: Optional[float] = None
+    completion_time: Optional[float] = None
+    reward: Optional[float] = None  # 任务的reward分数
+    
+    @property
+    def processing_time(self) -> float:
+        if self.start_time and self.completion_time:
+            return self.completion_time - self.start_time
+        return 0.0
+
+
+class UnifiedTaskStateManager:
+    """统一的任务状态管理器，集成所有任务状态相关的功能"""
+    
+    def __init__(self, num_prompts: int, n: int):
+        """
+        Args:
+            num_prompts: 总的 prompt 数量
+            n: 每个 prompt 的回复数量
+        """
+        self.num_prompts = num_prompts
+        self.n = n
+        
+        # 原 TaskTracker 的功能
+        self.active_tasks: Dict[int, TaskInfo] = {}
+        self.completed_tasks: Set[int] = set()
+        self.request_id_to_task: Dict[str, int] = {}
+        
+        # 统计每个 prompt 对应的 task 的完成情况
+        self.prompt_completion_status: Dict[int, Set[int]] = {i: set() for i in range(num_prompts)}
+        self.valid_prompt_indices: Set[int] = set()
+        
+        # 统计信息
+        self.completed_prompts = 0
+        self.valid_prompts = 0
+        
+        # 存储已完成任务的reward信息
+        self.completed_task_rewards: Dict[int, float] = {}
+        
+        # 任务队列管理
+        self.task_queue: asyncio.Queue = asyncio.Queue()
+        self.task_creation_done: asyncio.Event = asyncio.Event()
+        self.early_stop_signal: asyncio.Event = asyncio.Event()
+    
+    def add_task(self, task_info: TaskInfo):
+        """添加任务"""
+        self.active_tasks[task_info.task_index] = task_info
+        if task_info.request_id:
+            self.request_id_to_task[task_info.request_id] = task_info.task_index
+    
+    def update_task_reward(self, task_index: int, reward: float):
+        """更新任务的reward信息"""
+        if task_index in self.active_tasks:
+            self.active_tasks[task_index].reward = reward
+    
+    def complete_task(self, task_index: int, is_validation: bool = False) -> Optional[TaskInfo]:
+        """
+        完成任务并更新所有相关状态
+        
+        Args:
+            task_index: 任务索引
+            is_validation: 是否为验证模式
+            
+        Returns:
+            完成的任务信息，如果任务不存在则返回 None
+        """
+        if task_index not in self.active_tasks:
+            return None
+            
+        # 获取并移除任务信息
+        task_info = self.active_tasks.pop(task_index)
+        task_info.completion_time = time.time()
+        self.completed_tasks.add(task_index)
+        
+        # 存储已完成任务的reward信息
+        if task_info.reward is not None:
+            self.completed_task_rewards[task_index] = task_info.reward
+        
+        # 清理映射
+        if task_info.request_id and task_info.request_id in self.request_id_to_task:
+            del self.request_id_to_task[task_info.request_id]
+        
+        # 更新 prompt 完成状态
+        prompt_index = task_info.prompt_index
+        task_offset = task_info.task_offset
+        self.prompt_completion_status[prompt_index].add(task_offset)
+        
+        # 检查这个 prompt 是否完全完成
+        if len(self.prompt_completion_status[prompt_index]) == self.n:
+            self.completed_prompts += 1
+            
+            task_validity = self._check_prompt_score_variance(prompt_index)
+
+            # 如果提供了有效性信息，更新合法 prompt 统计
+            if task_validity:
+                self.valid_prompts += 1
+                self.valid_prompt_indices.add(prompt_index)
+            
+            # 打印完成信息
+            if is_validation:
+                print(f"[Validation] Prompt {prompt_index} 完成 (已完成 {self.completed_prompts}/{self.num_prompts} 个)")
+            else:
+                if task_validity:
+                    print(f"[EarlyStop] Prompt {prompt_index} 完成且合法 (已完成 {self.completed_prompts}/{self.num_prompts} 个，合法 {self.valid_prompts} 个)")
+                else:
+                    print(f"[EarlyStop] Prompt {prompt_index} 完成但不合法 (方差为0) (已完成 {self.completed_prompts}/{self.num_prompts} 个，合法 {self.valid_prompts} 个)")
+        
+        return task_info
+
+    def is_prompt_completed(self, prompt_index: int) -> bool:
+        """检查指定 prompt 是否完全完成"""
+        return len(self.prompt_completion_status[prompt_index]) == self.n
+    
+    def get_cancelled_requests_by_server(self, task_indices: Set[int]) -> Dict[str, List[str]]:
+        """获取被取消的请求按服务器分组（原 TaskTracker 方法）"""
+        cancelled_by_server = defaultdict(list)
+        for task_index in task_indices:
+            if task_index in self.active_tasks:
+                task_info = self.active_tasks[task_index]
+                if task_info.request_id:
+                    cancelled_by_server[task_info.server_address].append(task_info.request_id)
+        return dict(cancelled_by_server)
+    
+    def get_continuous_completed_prefix_length(self) -> int:
+        """获取从索引 0 开始的连续完成的前缀长度"""
+        continuous_completed_length = 0
+        for prompt_idx in range(self.num_prompts):
+            if self.is_prompt_completed(prompt_idx):
+                continuous_completed_length += 1
+            else:
+                break
+        return continuous_completed_length
+    
+    def get_valid_prompts_in_prefix(self, prefix_length: int) -> int:
+        """获取指定前缀长度中的合法 prompt 数量"""
+        return len([i for i in range(min(prefix_length, self.num_prompts)) if i in self.valid_prompt_indices])
+    
+    def _check_prompt_score_variance(self, prompt_index: int) -> bool:
+        """
+        检查一个 prompt 的 n 个回复的分数方差是否不为 0
+        
+        Args:
+            prompt_index: prompt 索引
+            
+        Returns:
+            bool: 方差不为 0 则返回 True，否则返回 False
+        """
+        scores = []
+        
+        # 收集该 prompt 对应的 n 个回复的分数
+        for task_offset in range(self.n):
+            task_index = prompt_index * self.n + task_offset
+            if task_index in self.completed_tasks:
+                # 从已完成的任务中查找对应的TaskInfo
+                # 由于任务已完成，需要从某个地方获取TaskInfo
+                # 这里我们需要一个已完成任务的记录
+                reward = self.completed_task_rewards.get(task_index, None)
+                if reward is not None:
+                    scores.append(reward)
+                else:
+                    logger.debug(f"Prompt {prompt_index}, task {task_offset}: 没有找到有效的reward")
+                    return False  # 存在没有reward的任务，整个 prompt 无效
+            else:
+                # 任务尚未完成
+                logger.debug(f"Prompt {prompt_index}, task {task_offset}: 任务尚未完成")
+                return False
+        
+        return len(scores) == self.n and np.var(scores) > 1e-8
+
 class ChatCompletionScheduler:
     def __init__(
         self,
@@ -293,62 +471,40 @@ class ChatCompletionScheduler:
             module = importlib.import_module(module_path)
             self.completion_callback = getattr(module, class_name)(config, self)
 
-    def submit_chat_completions(self, *, messages: List[Dict[str, str]], request_id: str, info: Dict[str, Any], address: str = None):
-        """Submit chat completion request without wait, completion_callback will be called when the request is done.
-
-        Args:
-            messages: List of messages.
-            request_id: Request id.
-            info: Any other auxiliary information pass across multi-turn.
-            address: Optional specific server address. If None, will randomly select from available servers.
-        """
-        # If no specific address provided, randomly select one
-        if address is None:
-            address = random.choice(self.server_addresses)
-        
-        # Store the selected address in info for later use
-        info["__selected_address__"] = address
-        info["__depth__"] += 1
-        task = asyncio.create_task(self._submit_chat_completions_and_callback(messages, request_id, info))
-
-        # "fire-and-forget" background tasks
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
-
     async def _submit_chat_completions_and_callback(
         self,
         messages: List[Dict[str, str]],
         request_id: str,
         info: Dict[str, Any],
+        address: Optional[str] = None,
     ):
         """Submit chat completion request, wait request finish and do callback."""
         # Check if a specific address was pre-selected
-        address = None
-        if "__selected_address__" in info:
-            address = info.pop("__selected_address__")
-        elif request_id:
-            request_id = request_id.removeprefix("chatcmpl-")
-            if request_id in self.request_id_to_address:
-                address = self.request_id_to_address.pop(request_id)
-        # Fallback to load balancing (legacy behavior)
         if address is None:
-            address = self.weighted_addresses[0][1]
-            self.weighted_addresses[0][0] += 1
-            heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
+            if request_id:
+                request_id = request_id.removeprefix("chatcmpl-")
+                if request_id in self.request_id_to_address:
+                    address = self.request_id_to_address.pop(request_id)
+            else:
+                address = self.weighted_addresses[0][1]
+                self.weighted_addresses[0][0] += 1
+                heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
 
         # use new request_id to avoid duplicate request_id problem
         request_id = uuid4().hex
         self.request_id_to_address[request_id] = address
 
-        # 记录 task 的 request_id 和 server address，用于后续 abort
+        # 更新任务的 request_id 和 start_time
         task_index = info.get("__task_index__")
-        task_request_ids = info.get("__task_request_ids__")
-        task_server_addresses = info.get("__task_server_addresses__")
-        if task_index is not None and task_request_ids is not None and task_server_addresses is not None:
-            task_request_ids[task_index] = request_id
-            task_server_addresses[task_index] = address
+        if task_index is not None and hasattr(self, '_current_unified_task_manager') and self._current_unified_task_manager:
+            # 找到对应的任务并更新信息
+            if task_index in self._current_unified_task_manager.active_tasks:
+                task_info = self._current_unified_task_manager.active_tasks[task_index]
+                task_info.request_id = request_id
+                task_info.start_time = time.time()
+                # 更新 request_id 到任务的映射
+                self._current_unified_task_manager.request_id_to_task[request_id] = task_index
 
-        completions, exception = None, None
         try:
             # NOTE: OpenAI client uses httpx, seems to have performance issue in high concurrency requests.
             completions = await self._chat_completions_aiohttp(
@@ -359,24 +515,21 @@ class ChatCompletionScheduler:
                 extra_headers={"x-request-id": request_id},
                 **info["__sampling_params__"],
             )
+
+            await self.completion_callback(messages, completions, info)
+            
+            # 在completion callback完成后，更新任务的reward信息
+            task_index = info.get("__task_index__")
+            if task_index is not None and hasattr(self, '_current_unified_task_manager') and self._current_unified_task_manager:
+                # 从messages中提取reward信息
+                if len(messages) > 0 and messages[-1].get("role") == "assistant":
+                    assistant_message = messages[-1]
+                    if "score" in assistant_message:
+                        reward = float(assistant_message["score"])
+                        self._current_unified_task_manager.update_task_reward(task_index, reward)
+                        
         except Exception as e:
-            # Let user handle the exception
-            exception = e
-
-        info["__depth__"] -= 1
-
-        if exception is not None:
-            pass
-            # logger.exception(f"chat completion failed with exception: {exception}")
-        else:
-            try:
-                await self.completion_callback(messages, completions, info)
-            except Exception as e:
-                logger.exception(f"completion callback failed with exception: {e}")
-
-        # No more ongoing completion requests
-        if info["__depth__"] == 0:
-            info["__done__"].set()
+            logger.exception(f"completion callback failed with exception: {e}")
 
     async def _chat_completions_aiohttp(self, address: str, **chat_complete_request) -> ChatCompletion:
         session = None
@@ -444,6 +597,12 @@ class ChatCompletionScheduler:
         n = 1 if is_validation else self.config.n
         batch_conversations = [None] * len(batch) * n
         
+        # 创建统一的任务状态管理器
+        unified_task_manager = UnifiedTaskStateManager(num_prompts=len(batch), n=n)
+        
+        # 将 unified_task_manager 设置为实例属性，以便在其他方法中使用
+        self._current_unified_task_manager = unified_task_manager
+        
         # 早停配置，验证模式下关闭早停机制
         if is_validation:
             min_valid_prompts = len(batch) * n  # 验证模式下等待所有任务完成
@@ -453,45 +612,24 @@ class ChatCompletionScheduler:
             min_valid_prompts = batch.meta_info.get("needed_valid_prompt_num", len(batch))
             print(f"[ChatCompletionScheduler] Early stop ratio: {min_valid_prompts}/{len(batch)}")
         
-        # 跟踪任务的 request_id 和 server address，用于后续 abort
-        task_request_ids = {}  # {task_index: request_id}
-        task_server_addresses = {}  # {task_index: server_address}
-        
         # 初始化批次对话
         for batch_index, conversation in enumerate(batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0)):
             batch_conversations[batch_index] = conversation.tolist()
-        
-        # 创建任务队列和相关的同步对象
-        task_queue = asyncio.Queue()
-        task_creation_done = asyncio.Event()
-        early_stop_signal = asyncio.Event()  # 早停信号
         
         # 启动动态任务创建器
         task_creator = asyncio.create_task(
             self._dynamic_task_creator(
                 batch_conversations=batch_conversations,
                 sampling_params=kwargs,
-                n=n,
-                task_request_ids=task_request_ids,
-                task_server_addresses=task_server_addresses,
-                task_queue=task_queue,
-                task_creation_done=task_creation_done,
-                early_stop_signal=early_stop_signal,
+                unified_task_manager=unified_task_manager,
             )
         )
         
         # 使用动态任务管理器等待任务完成
         num_prompts = len(batch)
-        completed_prompts, valid_prompts, valid_prompt_indices, cancelled_request_ids_by_address = await self._wait_with_dynamic_task_creation(
-            task_queue=task_queue,
-            task_creation_done=task_creation_done,
-            early_stop_signal=early_stop_signal,
-            batch_conversations=batch_conversations,
-            n=n,
-            num_prompts=num_prompts,
+        cancelled_request_ids_by_address = await self._wait_with_dynamic_task_creation(
+            unified_task_manager=unified_task_manager,
             min_valid_prompts=min_valid_prompts,
-            task_request_ids=task_request_ids,
-            task_server_addresses=task_server_addresses,
             is_validation=is_validation,
         )
         
@@ -502,36 +640,34 @@ class ChatCompletionScheduler:
                 await task_creator
             except asyncio.CancelledError:
                 pass
+
+        completed_prompts, valid_prompts, valid_prompt_indices = unified_task_manager.completed_prompts, unified_task_manager.valid_prompts, unified_task_manager.valid_prompt_indices
         
         if is_validation:
             print(f"[ChatCompletionScheduler] Validation completed: {completed_prompts}/{num_prompts} prompts processed")
-        else:
-            print(f"[ChatCompletionScheduler] Early stop triggered: {completed_prompts}/{num_prompts} prompts completed, {valid_prompts} valid prompts")
-            
-            # 在训练模式下，应用 FIFO 选择原则
-            if len(valid_prompt_indices) > min_valid_prompts:
-                valid_prompt_indices = self._apply_fifo_selection(valid_prompt_indices, min_valid_prompts)
-                valid_prompts = len(valid_prompt_indices)
-        
-        # 在 chat_scheduler 中进行过滤，同时返回合法索引给调用方
-        if not is_validation and len(valid_prompt_indices) < num_prompts:
-            # 过滤生成的数据
-            filtered_batch, filtered_conversations, filtered_n = self._filter_invalid_prompts(
-                batch, batch_conversations, valid_prompt_indices, n, num_prompts
-            )
-            print(f"[ChatCompletionScheduler] Filtered data: kept {len(valid_prompt_indices)}/{num_prompts} valid prompts")
-            
-            # 使用过滤后的数据进行 postprocess
-            output_batch = self.completion_callback.postprocess(filtered_batch, filtered_conversations, n=filtered_n)
-            
-            # 返回合法的 prompt 索引给调用方，让调用方也过滤 new_batch
-            output_batch.meta_info["valid_prompt_indices"] = sorted(list(valid_prompt_indices))
-            output_batch.meta_info["need_filtering"] = True
-        else:
             # 验证模式或所有 prompt 都合法时，不过滤
             output_batch = self.completion_callback.postprocess(batch, batch_conversations, n=n)
             output_batch.meta_info["valid_prompt_indices"] = list(range(num_prompts))
             output_batch.meta_info["need_filtering"] = False
+        else:
+            print(f"[ChatCompletionScheduler] Early stop triggered: {completed_prompts}/{num_prompts} prompts completed, {valid_prompts} valid prompts")
+            
+            # 在训练模式下，应用 FIFO 选择原则
+            valid_prompt_indices = self._apply_fifo_selection(valid_prompt_indices, min_valid_prompts)
+            valid_prompts = len(valid_prompt_indices)
+        
+            # 过滤生成的数据
+            filtered_batch, filtered_conversations = self._filter_invalid_prompts(
+                batch, batch_conversations, valid_prompt_indices, n
+            )
+            print(f"[ChatCompletionScheduler] Filtered data: kept {len(valid_prompt_indices)}/{num_prompts} valid prompts")
+            
+            # 使用过滤后的数据进行 postprocess
+            output_batch = self.completion_callback.postprocess(filtered_batch, filtered_conversations, n=n)
+            
+            # 返回合法的 prompt 索引给调用方，让调用方也过滤 new_batch
+            output_batch.meta_info["valid_prompt_indices"] = sorted(list(valid_prompt_indices))
+            output_batch.meta_info["need_filtering"] = True            
         
         output_batch.meta_info["timing"] = {
             "generate_sequences": time.time() - t_start,
@@ -541,385 +677,268 @@ class ChatCompletionScheduler:
         output_batch.meta_info["total_prompts"] = num_prompts
         output_batch.meta_info["original_prompts"] = num_prompts
         output_batch.meta_info["cancelled_request_ids_by_address"] = cancelled_request_ids_by_address
+        
+        # 清理临时的统一任务管理器引用
+        if hasattr(self, '_current_unified_task_manager'):
+            delattr(self, '_current_unified_task_manager')
+        
         print("[ChatCompletionScheduler] generate_sequences done")
         return output_batch
 
-    async def _wait_with_dynamic_task_creation(self, task_queue: asyncio.Queue, task_creation_done: asyncio.Event, early_stop_signal: asyncio.Event, batch_conversations: List[List[Dict[str, str]]], n: int, num_prompts: int, min_valid_prompts: int, task_request_ids: Dict[int, str], task_server_addresses: Dict[int, str], is_validation: bool = False) -> tuple[int, int, set, dict]:
+    async def _wait_with_dynamic_task_creation(self, unified_task_manager: UnifiedTaskStateManager, min_valid_prompts: int, is_validation: bool = False) -> tuple[int, int, set, dict]:
         """
         等待任务完成，基于合法 prompt 数量的早停功能，支持动态任务创建
         
         Args:
-            task_queue: 任务队列
-            task_creation_done: 任务创建完成信号
-            early_stop_signal: 早停信号
-            batch_conversations: 对话列表，用于为未完成任务提供默认值
-            n: 每个输入prompt的生成数量
-            num_prompts: 总的 prompt 数量
+            unified_task_manager: 统一的任务状态管理器
             min_valid_prompts: 最少需要的合法 prompt 数量
-            task_request_ids: 任务索引到request_id的映射
-            task_server_addresses: 任务索引到server_address的映射
             is_validation: 是否为验证模式
             
         Returns:
             (实际完成的 prompt 数量, 合法的 prompt 数量, 合法的 prompt 索引集合, 被取消的 request_id 集合)
         """
-        # 跟踪每个 prompt 的任务完成情况: {prompt_index: set of completed task_offsets}
-        prompt_completion_status = {i: set() for i in range(num_prompts)}
-        # 记录合法的 prompt 索引
-        valid_prompt_indices = set()
-        completed_prompts = 0
-        valid_prompts = 0
+        # 已经发送到服务器的任务
         pending_tasks = set()
         # 收集被取消的 request_id 按地址分组
         cancelled_request_ids_by_address = {}
         
-        try:
-            # 动态管理任务：既要从队列获取新任务，也要等待现有任务完成
-            while not task_creation_done.is_set() or pending_tasks or not task_queue.empty():
-                # 检查是否达到早停条件（仅训练模式）
-                # 使用 FIFO 策略：确保选择的 valid prompts 和它们之前的所有 prompts 都已完成
-                if not is_validation:
-                    can_early_stop, early_stop_prefix_length = self._check_fifo_early_stop_condition(
-                        prompt_completion_status, valid_prompt_indices, n, min_valid_prompts
-                    )
-                    if can_early_stop:
-                        print(f"[EarlyStop] 达到 FIFO 早停条件：前 {early_stop_prefix_length} 个 prompts 都已完成，"
-                              f"其中有 {len([i for i in range(early_stop_prefix_length) if i in valid_prompt_indices])} 个合法 prompts (需要 {min_valid_prompts} 个)")
-                        early_stop_signal.set()  # 设置早停信号，通知任务创建器停止创建新任务
-                        break
-                
-                # 从队列获取新任务（非阻塞）
-                new_tasks_added = 0
-                while not task_queue.empty():
-                    try:
-                        task = task_queue.get_nowait()
-                        pending_tasks.add(task)
-                        new_tasks_added += 1
-                    except asyncio.QueueEmpty:
-                        break
-                
-                if new_tasks_added > 0:
-                    print(f"[TaskManager] 添加了 {new_tasks_added} 个新任务，当前待处理任务数：{len(pending_tasks)}")
-                
-                # 如果没有待处理任务，等待新任务或任务创建完成
-                if not pending_tasks:
-                    if not task_creation_done.is_set():
-                        await asyncio.sleep(0.1)  # 短暂等待新任务
-                        continue
-                    else:
-                        break  # 任务创建完成且无待处理任务
-                
-                # 等待至少一个任务完成
-                done_tasks, pending_tasks = await asyncio.wait(
-                    pending_tasks, return_when=asyncio.FIRST_COMPLETED
-                )
-                
-                # 检查完成的任务并更新 prompt 完成状态
-                for task in done_tasks:
-                    try:
-                        await task  # 获取任务结果，如果有异常会被抛出
-                        
-                        # 更新对应 prompt 的完成状态
-                        prompt_index = getattr(task, '_prompt_index', None)
-                        task_offset = getattr(task, '_task_offset', None)
-                        
-                        if prompt_index is not None and task_offset is not None:
-                            prompt_completion_status[prompt_index].add(task_offset)
-                            
-                            # 检查这个 prompt 是否完全完成（所有 n 个任务都完成）
-                            if len(prompt_completion_status[prompt_index]) == n:
-                                completed_prompts += 1
-                                
-                                if is_validation:
-                                    # 验证模式下所有完成的 prompt 都算作合法
-                                    valid_prompts += 1
-                                    valid_prompt_indices.add(prompt_index)
-                                    print(f"[Validation] Prompt {prompt_index} 完成 (已完成 {completed_prompts}/{num_prompts} 个)")
-                                else:
-                                    # 训练模式下检查该 prompt 是否合法（分数方差不为0）
-                                    is_valid = self._check_prompt_score_variance(batch_conversations, prompt_index, n)
-                                    if is_valid:
-                                        valid_prompts += 1
-                                        valid_prompt_indices.add(prompt_index)
-                                        print(f"[EarlyStop] Prompt {prompt_index} 完成且合法 (已完成 {completed_prompts}/{num_prompts} 个，合法 {valid_prompts} 个)")
-                                    else:
-                                        print(f"[EarlyStop] Prompt {prompt_index} 完成但不合法 (方差为0) (已完成 {completed_prompts}/{num_prompts} 个，合法 {valid_prompts} 个)")
-                                
-                    except Exception as e:
-                        logger.exception(f"Task failed with exception: {e}")
-                        # 为失败的任务提供默认对话
-                        task_index = getattr(task, '_task_index', None)
-                        if task_index is not None:
-                            self._provide_default_conversation(batch_conversations, task_index)
-            
-            # 检查是否达到 FIFO 早停条件（验证模式下不会早停）
+        # 动态管理任务：既要从队列获取新任务，也要等待现有任务完成
+        while not unified_task_manager.task_creation_done.is_set() or pending_tasks or not unified_task_manager.task_queue.empty():
+            # 检查是否达到早停条件（仅训练模式）
+            # 使用 FIFO 策略：确保选择的 valid prompts 和它们之前的所有 prompts 都已完成
             if not is_validation:
-                can_early_stop, early_stop_prefix_length = self._check_fifo_early_stop_condition(
-                    prompt_completion_status, valid_prompt_indices, n, min_valid_prompts
-                )
-                if can_early_stop and (pending_tasks or not task_queue.empty()):
-                    print(f"[EarlyStop] 达到 FIFO 早停条件，取消剩余任务")
-                    
-                    # 更新 valid_prompt_indices，按照 FIFO 原则选择前 min_valid_prompts 个合法 prompts
-                    fifo_valid_prompt_indices = []
-                    for i in range(early_stop_prefix_length):
-                        if i in valid_prompt_indices:
-                            fifo_valid_prompt_indices.append(i)
-                            if len(fifo_valid_prompt_indices) >= min_valid_prompts:
-                                break
-                    
-                    valid_prompt_indices = set(fifo_valid_prompt_indices)
-                    valid_prompts = len(valid_prompt_indices)
-                    completed_prompts = early_stop_prefix_length
-                    
-                    print(f"[EarlyStop] FIFO 策略保留前 {early_stop_prefix_length} 个 prompts，按顺序选择前 {valid_prompts} 个合法 prompts (需要 {min_valid_prompts} 个)")
-                    
-                    # 设置早停信号，确保任务创建器停止
-                    early_stop_signal.set()
-                    
-                    # 取消队列中尚未开始的任务
-                    cancelled_from_queue = 0
-                    while not task_queue.empty():
-                        try:
-                            task = task_queue.get_nowait()
-                            task.cancel()
-                            task_index = getattr(task, '_task_index', None)
-                            if task_index is not None:
-                                self._provide_default_conversation(batch_conversations, task_index)
-                            cancelled_from_queue += 1
-                        except asyncio.QueueEmpty:
-                            break
-                    
-                    if cancelled_from_queue > 0:
-                        print(f"[EarlyStop] 从队列中取消了 {cancelled_from_queue} 个尚未开始的任务")
-                    
-                    # 收集被取消任务的 request_id 和 server address
-                    for task in pending_tasks:
-                        task_index = getattr(task, '_task_index', None)
-                        if task_index is not None:
-                            # 收集 request_id 和 server address
-                            if task_index in task_request_ids and task_index in task_server_addresses:
-                                request_id = task_request_ids[task_index]
-                                server_address = task_server_addresses[task_index]
-                                if server_address not in cancelled_request_ids_by_address:
-                                    cancelled_request_ids_by_address[server_address] = []
-                                cancelled_request_ids_by_address[server_address].append(request_id)
-                    
-                    # 取消所有待处理的任务
-                    for task in pending_tasks:
-                        task.cancel()
-                        task_index = getattr(task, '_task_index', None)
-                        if task_index is not None:
-                            self._provide_default_conversation(batch_conversations, task_index)
-                    
-                    # 等待取消的任务清理完成，使用更短的超时避免无限等待
-                    print(f"[EarlyStop] 等待 {len(pending_tasks)} 个被取消任务的清理...")
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*pending_tasks, return_exceptions=True),
-                            timeout=30.0  # 30秒超时
-                        )
-                        print("[EarlyStop] 所有被取消任务已完成清理")
-                    except asyncio.TimeoutError:
-                        print("[EarlyStop] 警告：部分任务清理超时，可能存在未完成的服务器端操作")
-                    except Exception as e:
-                        logger.exception(f"[EarlyStop] 任务清理过程中发生错误: {e}")
-                    
-                    # 立即abort服务器端请求（在取消客户端任务之前）
-                    if cancelled_request_ids_by_address and self.abort_callback and callable(self.abort_callback):
-                        print(f"[EarlyStop] 立即abort {sum(len(ids) for ids in cancelled_request_ids_by_address.values())} 个服务器端请求")
-                        try:
-                            # Run abort in a separate thread to avoid blocking the event loop
-                            def abort_in_thread():
-                                self.abort_callback(cancelled_request_ids_by_address)
-                            
-                            import threading
-                            abort_thread = threading.Thread(target=abort_in_thread, daemon=True)
-                            abort_thread.start()
-                            
-                            # Give abort operations a chance to start
-                            await asyncio.sleep(0.2)
-                        except Exception as e:
-                            logger.exception(f"Error calling abort_callback: {e}")
-
-                    # 额外等待时间，确保服务器端操作完成
-                    print("[EarlyStop] 等待服务器端操作完成...")
-                    await asyncio.sleep(2.0)  # 给服务器端额外的清理时间
-                    
-                    # 清空待处理任务集合
-                    pending_tasks = set()
-            else:
-                # 等待所有剩余任务完成
-                if pending_tasks:
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
-                    # 重新计算完成的 prompt 数量
-                    completed_prompts = sum(1 for status in prompt_completion_status.values() if len(status) == n)
-                    
-                    # 重新计算合法 prompt 数量
-                    valid_prompts = 0
-                    valid_prompt_indices.clear()
-                    for prompt_index in range(num_prompts):
-                        if len(prompt_completion_status[prompt_index]) == n:
-                            if is_validation:
-                                # 验证模式下所有完成的 prompt 都算作合法
-                                valid_prompts += 1
-                                valid_prompt_indices.add(prompt_index)
-                            else:
-                                # 训练模式下检查分数方差
-                                if self._check_prompt_score_variance(batch_conversations, prompt_index, n):
-                                    valid_prompts += 1
-                                    valid_prompt_indices.add(prompt_index)
-                    
-        except Exception as e:
-            logger.exception(f"Error in _wait_with_dynamic_task_creation: {e}")
-            # 设置早停信号，确保任务创建器停止
-            early_stop_signal.set()
-            # 确保所有任务都被取消
-            for task in pending_tasks:
-                task.cancel()
-                task_index = getattr(task, '_task_index', None)
-                if task_index is not None:
-                    self._provide_default_conversation(batch_conversations, task_index)
-            # 也要取消队列中的任务
-            while not task_queue.empty():
+                can_early_stop, early_stop_prefix_length = self._check_fifo_early_stop_condition(unified_task_manager, min_valid_prompts)
+                if can_early_stop:
+                    print(f"[EarlyStop] 达到 FIFO 早停条件：前 {early_stop_prefix_length} 个 prompts 都已完成，"
+                            f"其中有 {unified_task_manager.get_valid_prompts_in_prefix(early_stop_prefix_length)} 个合法 prompts (需要 {min_valid_prompts} 个)")
+                    unified_task_manager.early_stop_signal.set()  # 设置早停信号，通知任务创建器停止创建新任务
+                    break
+            
+            # 从队列获取新任务（非阻塞）
+            new_tasks_added = 0
+            while not unified_task_manager.task_queue.empty():
                 try:
-                    task = task_queue.get_nowait()
-                    task.cancel()
+                    task = unified_task_manager.task_queue.get_nowait()
+                    pending_tasks.add(task)
+                    new_tasks_added += 1
                 except asyncio.QueueEmpty:
                     break
-            raise
             
-        return completed_prompts, valid_prompts, valid_prompt_indices, cancelled_request_ids_by_address
+            if new_tasks_added > 0:
+                print(f"[TaskManager] 添加了 {new_tasks_added} 个新任务，当前待处理任务数：{len(pending_tasks)}")
+            
+            # 如果没有待处理任务，等待新任务或任务创建完成
+            if not pending_tasks:
+                if not unified_task_manager.task_creation_done.is_set():
+                    await asyncio.sleep(0.1)  # 短暂等待新任务
+                    continue
+                else:
+                    break  # 任务创建完成且无待处理任务
+            
+            # 等待至少一个任务完成
+            done_tasks, pending_tasks = await asyncio.wait(
+                pending_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 检查完成的任务并更新 prompt 完成状态
+            for task in done_tasks:
+                try:
+                    await task  # 获取任务结果，如果有异常会被抛出
+                    
+                    # 获取任务信息
+                    task_index = getattr(task, '_task_index', None)
+                    
+                    if task_index is not None:
+                        # 使用统一任务管理器标记任务完成，所有逻辑都在complete_task中处理
+                        _ = unified_task_manager.complete_task(
+                            task_index, 
+                            is_validation=is_validation
+                        )
+                except Exception as e:
+                    logger.exception(f"Task failed with exception: {e}")
 
-    async def _dynamic_task_creator(self, batch_conversations: List[List[Dict[str, str]]], sampling_params: Dict[str, Any], n: int, task_request_ids: Dict[int, str], task_server_addresses: Dict[int, str], task_queue: asyncio.Queue, task_creation_done: asyncio.Event, early_stop_signal: asyncio.Event):
+        # 如果早停信号被设置，则取消剩余任务
+        if unified_task_manager.early_stop_signal.is_set():
+            print("[EarlyStop] 收到早停信号，取消剩余任务")
+            # 收集被取消任务的索引
+            cancelled_task_indices = set()
+            
+            # 取消队列中尚未开始的任务
+            cancelled_from_queue = 0
+            while not unified_task_manager.task_queue.empty():
+                try:
+                    task = unified_task_manager.task_queue.get_nowait()
+                    task.cancel()
+                    task_index = getattr(task, '_task_index', None)
+                    if task_index is not None:
+                        cancelled_task_indices.add(task_index)
+                    cancelled_from_queue += 1
+                except asyncio.QueueEmpty:
+                    break
+            
+            if cancelled_from_queue > 0:
+                print(f"[EarlyStop] 从队列中取消了 {cancelled_from_queue} 个尚未处理的任务")
+            
+            # 收集待处理任务的索引
+            for task in pending_tasks:
+                task_index = getattr(task, '_task_index', None)
+                if task_index is not None:
+                    cancelled_task_indices.add(task_index)
+                task.cancel()
+            
+            # 清空待处理任务集合
+            pending_tasks = set()
+            
+            # 使用统一任务管理器获取被取消的请求按服务器分组
+            cancelled_request_ids_by_address = unified_task_manager.get_cancelled_requests_by_server(cancelled_task_indices)
+            
+            # 等待取消的任务清理完成，使用更短的超时避免无限等待
+            print(f"[EarlyStop] 等待 {len(pending_tasks)} 个被取消任务的清理...")
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_tasks, return_exceptions=True),
+                    timeout=30.0  # 30秒超时
+                )
+                print("[EarlyStop] 所有被取消任务已完成清理")
+            except asyncio.TimeoutError:
+                print("[EarlyStop] 警告：部分任务清理超时，可能存在未完成的服务器端操作")
+            except Exception as e:
+                logger.exception(f"[EarlyStop] 任务清理过程中发生错误: {e}")
+            
+            # 立即abort服务器端请求（在取消客户端任务之前）
+            if cancelled_request_ids_by_address and self.abort_callback and callable(self.abort_callback):
+                print(f"[EarlyStop] 立即abort {sum(len(ids) for ids in cancelled_request_ids_by_address.values())} 个服务器端请求")
+                try:
+                    self.abort_callback(cancelled_request_ids_by_address)
+                except Exception as e:
+                    logger.exception(f"Error calling abort_callback: {e}")
+            
+        return cancelled_request_ids_by_address
+
+    async def _dynamic_task_creator(self, batch_conversations: List[List[Dict[str, str]]], sampling_params: Dict[str, Any], unified_task_manager: UnifiedTaskStateManager):
         """
         动态任务创建器：根据服务器负载情况分批次创建任务
         
         Args:
             batch_conversations: 批次对话列表
             sampling_params: 采样参数
-            n: 每个 prompt 的回复数量
-            task_request_ids: 任务索引到request_id的映射
-            task_server_addresses: 任务索引到server_address的映射
-            task_queue: 任务队列
-            task_creation_done: 任务创建完成信号
-            early_stop_signal: 早停信号
+            unified_task_manager: 统一的任务状态管理器
         """
-        try:
-            total_tasks = len(batch_conversations)
-            created_tasks = 0
+        total_tasks = len(batch_conversations)
+        created_tasks = 0
+        n = unified_task_manager.n
+        
+        # 默认配置
+        batch_creation_interval = getattr(self.config, 'batch_creation_interval', 10)  # 批次创建间隔（秒）
+        max_concurrent_per_server = getattr(self.config, 'max_concurrent_per_server', 512)  # 每个服务器最大并发数
+        
+        print(f"[TaskCreator] 开始动态创建 {total_tasks} 个任务")
+        print(f"[TaskCreator] 配置：batch_creation_interval={batch_creation_interval}, max_concurrent_per_server={max_concurrent_per_server}")
+        
+        while created_tasks < total_tasks:
+            # 检查早停信号
+            if unified_task_manager.early_stop_signal.is_set():
+                print(f"[TaskCreator] 收到早停信号，停止创建任务。已创建 {created_tasks}/{total_tasks} 个任务")
+                break
             
-            # 默认配置
-            batch_creation_interval = getattr(self.config, 'batch_creation_interval', 10)  # 批次创建间隔（秒）
-            max_concurrent_per_server = getattr(self.config, 'max_concurrent_per_server', 512)  # 每个服务器最大并发数
+            # 第一步：调用 get_load_callback 获取所有服务的负载情况
+            server_loads = {}
+            if self.get_load_callback and callable(self.get_load_callback):
+                try:
+                    server_loads = await self.get_load_callback()
+                    print(f"[TaskCreator] 获取服务器负载情况：{server_loads}")
+                except Exception as e:
+                    print(f"[TaskCreator] Error calling get_load_callback: {e}")
+                    # 如果获取负载失败，使用默认策略
+                    server_loads = {}
             
-            print(f"[TaskCreator] 开始动态创建 {total_tasks} 个任务")
-            print(f"[TaskCreator] 配置：batch_creation_interval={batch_creation_interval}, max_concurrent_per_server={max_concurrent_per_server}")
+            # 第二步：计算每个服务器可以接收的新任务数量
+            server_capacities = {}
+            for address in self.server_addresses:
+                current_load = server_loads.get(address, 0)
+                available_capacity = max(0, max_concurrent_per_server - current_load)
+                server_capacities[address] = available_capacity
             
-            while created_tasks < total_tasks:
-                # 检查早停信号
-                if early_stop_signal.is_set():
-                    print(f"[TaskCreator] 收到早停信号，停止创建任务。已创建 {created_tasks}/{total_tasks} 个任务")
-                    break
+            total_capacity = sum(server_capacities.values())
+            print(f"[TaskCreator] 服务器容量情况：{server_capacities}，总容量：{total_capacity}")
+
+            if total_capacity == 0:
+                print("[TaskCreator] 所有服务器都已满载，等待...")
+                await asyncio.sleep(batch_creation_interval)
+                continue
+            
+            # 第三步：使用 round-robin 方式分配任务
+            tasks_to_create = min(total_capacity, total_tasks - created_tasks)
+            
+            # 创建有容量的服务器地址列表
+            available_servers = [address for address, capacity in server_capacities.items() if capacity > 0]
+            
+            # 使用 round-robin 方式分配任务
+            server_index = 0
+            tasks_created_this_round = 0
+            
+            while tasks_created_this_round < tasks_to_create and created_tasks < total_tasks:
+                # 选择当前服务器
+                current_server = available_servers[server_index]
                 
-                # 第一步：调用 get_load_callback 获取所有服务的负载情况
-                server_loads = {}
-                if self.get_load_callback and callable(self.get_load_callback):
-                    try:
-                        server_loads = await self.get_load_callback()
-                        print(f"[TaskCreator] 获取服务器负载情况：{server_loads}")
-                    except Exception as e:
-                        print(f"[TaskCreator] Error calling get_load_callback: {e}")
-                        # 如果获取负载失败，使用默认策略
-                        server_loads = {}
-                
-                # 第二步：计算每个服务器可以接收的新任务数量
-                server_capacities = {}
-                for address in self.server_addresses:
-                    current_load = server_loads.get(address, 0)
-                    available_capacity = max(0, max_concurrent_per_server - current_load)
-                    server_capacities[address] = available_capacity
-                
-                total_capacity = sum(server_capacities.values())
-                print(f"[TaskCreator] 服务器容量情况：{server_capacities}，总容量：{total_capacity}")
-                
-                # 第三步：使用 round-robin 方式分配任务
-                if total_capacity > 0:
-                    tasks_to_create = min(total_capacity, total_tasks - created_tasks)
+                # 检查当前服务器是否还有容量
+                if server_capacities[current_server] > 0:
+                    batch_index = created_tasks
+                    conversation = batch_conversations[batch_index]
+                    prompt_index = batch_index // n
+                    task_offset = batch_index % n
                     
-                    # 创建有容量的服务器地址列表
-                    available_servers = [address for address, capacity in server_capacities.items() if capacity > 0]
+                    # 创建任务信息并添加到统一任务管理器
+                    task_info = TaskInfo(
+                        task_index=batch_index,
+                        prompt_index=prompt_index,
+                        task_offset=task_offset,
+                        server_address=current_server,
+                        request_id=None,  # 将在 _submit_chat_completions_and_callback 中设置
+                        start_time=None,  # 将在任务开始时设置
+                    )
+                    unified_task_manager.add_task(task_info)
                     
-                    if available_servers:
-                        # 使用 round-robin 方式分配任务
-                        server_index = 0
-                        tasks_created_this_round = 0
-                        
-                        while tasks_created_this_round < tasks_to_create and created_tasks < total_tasks:
-                            # 选择当前服务器
-                            current_server = available_servers[server_index]
-                            
-                            # 检查当前服务器是否还有容量
-                            if server_capacities[current_server] > 0:
-                                batch_index = created_tasks
-                                conversation = batch_conversations[batch_index]
-                                prompt_index = batch_index // n
-                                task_offset = batch_index % n
-                                
-                                # 创建任务，指定使用当前服务器
-                                task = asyncio.create_task(
-                                    self._submit_chat_completions_semaphore(
-                                        messages=conversation,
-                                        request_id=None,
-                                        sampling_params=sampling_params,
-                                        task_index=batch_index,
-                                        task_request_ids=task_request_ids,
-                                        task_server_addresses=task_server_addresses,
-                                        address=current_server,
-                                    )
-                                )
-                                
-                                # 为任务添加索引信息
-                                task._task_index = batch_index
-                                task._prompt_index = prompt_index
-                                task._task_offset = task_offset
-                                
-                                await task_queue.put(task)
-                                created_tasks += 1
-                                tasks_created_this_round += 1
-                                
-                                # 减少该服务器的剩余容量
-                                server_capacities[current_server] -= 1
-                                
-                                # print(f"[TaskCreator] 创建任务 {created_tasks}/{total_tasks} 到服务器 {current_server}")
-                            
-                            # 轮询到下一个服务器
-                            server_index = (server_index + 1) % len(available_servers)
-                            
-                            # 如果轮询一圈后发现所有服务器都没有容量了，退出循环
-                            if server_index == 0:
-                                remaining_capacity = sum(server_capacities[addr] for addr in available_servers)
-                                if remaining_capacity == 0:
-                                    break
+                    # 创建任务，指定使用当前服务器
+                    task = asyncio.create_task(
+                        self._submit_chat_completions_semaphore(
+                            messages=conversation,
+                            request_id=None,
+                            sampling_params=sampling_params,
+                            task_index=batch_index,
+                            address=current_server,
+                        )
+                    )
                     
-                    print(f"[TaskCreator] 本轮使用 round-robin 创建了 {tasks_created_this_round} 个任务，总进度：{created_tasks}/{total_tasks}")
-                else:
-                    print("[TaskCreator] 所有服务器都已满载，等待...")
+                    # 为任务添加索引信息
+                    task._task_index = batch_index
+                    await unified_task_manager.task_queue.put(task)
+                    created_tasks += 1
+                    tasks_created_this_round += 1
+                    
+                    # 减少该服务器的剩余容量
+                    server_capacities[current_server] -= 1
+
+                # 轮询到下一个服务器
+                server_index = (server_index + 1) % len(available_servers)
                 
-                # 第四步：如果还有任务需要创建，等待一段时间
-                if created_tasks < total_tasks:
-                    await asyncio.sleep(batch_creation_interval)
+                # 如果轮询一圈后发现所有服务器都没有容量了，退出循环
+                if server_index == 0:
+                    remaining_capacity = sum(server_capacities[addr] for addr in available_servers)
+                    if remaining_capacity == 0:
+                        break
             
-            print(f"[TaskCreator] 完成所有 {total_tasks} 个任务的创建")
-            task_creation_done.set()
+            print(f"[TaskCreator] 本轮使用 round-robin 创建了 {tasks_created_this_round} 个任务，总进度：{created_tasks}/{total_tasks}")
             
-        except Exception as e:
-            logger.exception(f"Error in _dynamic_task_creator: {e}")
-            task_creation_done.set()  # 即使出错也要设置完成信号
-            raise
+            # 第四步：如果还有任务需要创建，等待一段时间
+            if created_tasks < total_tasks:
+                await asyncio.sleep(batch_creation_interval)
+        
+        print(f"[TaskCreator] 完成所有 {total_tasks} 个任务的创建")
+        unified_task_manager.task_creation_done.set()
 
     def _filter_invalid_prompts(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], 
-                               valid_prompt_indices: set, n: int, num_prompts: int) -> tuple[DataProto, List[List[Dict[str, str]]], int]:
+                               valid_prompt_indices: set, n: int) -> tuple[DataProto, List[List[Dict[str, str]]], int]:
         """
         过滤掉非法的 prompt，只保留合法的数据
         
@@ -932,97 +951,27 @@ class ChatCompletionScheduler:
             
         Returns:
             (过滤后的批次数据, 过滤后的对话列表, 新的 n 值)
-        """
-        try:
-            # 创建有序的合法 prompt 索引列表
-            sorted_valid_prompt_indices = sorted(list(valid_prompt_indices))
-            
-            # 1. 构建任务级别的索引（用于过滤 batch_conversations 和任务级数据）
-            task_indices = []
-            for prompt_idx in sorted_valid_prompt_indices:
-                for task_offset in range(n):
-                    task_index = prompt_idx * n + task_offset
-                    if task_index < len(batch_conversations):
-                        task_indices.append(task_index)
-            
-            # 2. 过滤 batch_conversations
-            filtered_conversations = [batch_conversations[i] for i in task_indices]
-            
-            # 3. 处理 batch 数据的过滤
-            filtered_batch = batch.select_idxs(sorted_valid_prompt_indices)
-
-            return filtered_batch, filtered_conversations, n
-            
-        except Exception as e:
-            logger.exception(f"Error filtering invalid prompts: {e}")
-            # 发生错误时返回原始数据
-            return batch, batch_conversations, n
-    
-    def _check_prompt_score_variance(self, batch_conversations: List[List[Dict[str, str]]], prompt_index: int, n: int) -> bool:
-        """
-        检查一个 prompt 的 n 个回复的分数方差是否不为 0
+        """        # 创建有序的合法 prompt 索引列表
+        sorted_valid_prompt_indices = sorted(list(valid_prompt_indices))
         
-        Args:
-            batch_conversations: 对话列表
-            prompt_index: prompt 索引
-            n: 每个 prompt 的回复数量
-            
-        Returns:
-            bool: 方差不为 0 则返回 True，否则返回 False
-        """
-        try:
-            scores = []
-            
-            # 收集该 prompt 对应的 n 个回复的分数
+        # 1. 构建任务级别的索引（用于过滤 batch_conversations 和任务级数据）
+        task_indices = []
+        for prompt_idx in sorted_valid_prompt_indices:
             for task_offset in range(n):
-                task_index = prompt_index * n + task_offset
-                if task_index < len(batch_conversations) and batch_conversations[task_index] is not None:
-                    conversation = batch_conversations[task_index]
-                    if len(conversation) > 0:
-                        # 找到最后一个 assistant 回复
-                        found_valid_assistant = False
-                        for message in reversed(conversation):
-                            if message.get("role") == "assistant" and "score" in message:
-                                scores.append(float(message["score"]))
-                                found_valid_assistant = True
-                                break
-                        
-                        # 如果没找到带分数的 assistant 回复，说明这是一个非法 conversation
-                        if not found_valid_assistant:
-                            logger.debug(f"Prompt {prompt_index}, task {task_offset}: 没有找到有效的 assistant 回复")
-                            return False  # 存在非法 conversation，整个 prompt 无效
-                    else:
-                        # conversation 为空，非法
-                        logger.debug(f"Prompt {prompt_index}, task {task_offset}: conversation 为空")
-                        return False
-                else:
-                    # conversation 不存在或为 None，非法
-                    logger.debug(f"Prompt {prompt_index}, task {task_offset}: conversation 不存在")
-                    return False
-            
-            # 检查是否收集到了 n 个分数
-            if len(scores) != n:
-                logger.warning(f"Prompt {prompt_index} expected {n} scores but got {len(scores)}")
-                return False
-            
-            # 计算方差
-            import numpy as np
-            variance = np.var(scores)
-            
-            # 检查方差是否不为 0（考虑浮点数精度）
-            is_valid = variance > 1e-8
-            
-            if not is_valid:
-                logger.debug(f"Prompt {prompt_index} scores: {scores}, variance: {variance}")
-            
-            return is_valid
-            
-        except Exception as e:
-            logger.exception(f"Error checking score variance for prompt {prompt_index}: {e}")
-            return False
+                task_index = prompt_idx * n + task_offset
+                if task_index < len(batch_conversations):
+                    task_indices.append(task_index)
+        
+        # 2. 过滤 batch_conversations
+        filtered_conversations = [batch_conversations[i] for i in task_indices]
+        
+        # 3. 处理 batch 数据的过滤
+        filtered_batch = batch.select_idxs(sorted_valid_prompt_indices)
+
+        return filtered_batch, filtered_conversations
     
-    def _check_fifo_early_stop_condition(self, prompt_completion_status: Dict[int, set], 
-                                         valid_prompt_indices: set, n: int, min_valid_prompts: int) -> tuple[bool, int]:
+    def _check_fifo_early_stop_condition(self, unified_task_manager: UnifiedTaskStateManager, 
+                                         min_valid_prompts: int) -> tuple[bool, int]:
         """
         检查基于 FIFO 策略的早停条件
         
@@ -1030,34 +979,23 @@ class ChatCompletionScheduler:
         则可以进行早停，以保证数据分布的完整性。
         
         Args:
-            prompt_completion_status: 每个 prompt 的完成状态
-            valid_prompt_indices: 合法的 prompt 索引集合
-            n: 每个 prompt 的回复数量
+            unified_task_manager: 统一的任务状态管理器
             min_valid_prompts: 最少需要的合法 prompt 数量
             
         Returns:
             (是否可以早停, 连续完成的前缀长度)
         """
-        # 找到从索引 0 开始的连续完成的前缀
-        continuous_completed_length = 0
-        for prompt_idx in range(len(prompt_completion_status)):
-            if len(prompt_completion_status[prompt_idx]) == n:
-                # 这个 prompt 已完成
-                continuous_completed_length += 1
-            else:
-                # 遇到未完成的 prompt，停止
-                break
+        # 使用 UnifiedTaskStateManager 的方法获取连续完成的前缀长度
+        continuous_completed_length = unified_task_manager.get_continuous_completed_prefix_length()
         
         if continuous_completed_length == 0:
             return False, 0
         
-        # 在连续完成的前缀中计算 valid prompts 数量
-        valid_prompts_in_prefix = len([i for i in range(continuous_completed_length) if i in valid_prompt_indices])
+        # 使用 UnifiedTaskStateManager 的方法计算前缀中的 valid prompts 数量
+        valid_prompts_in_prefix = unified_task_manager.get_valid_prompts_in_prefix(continuous_completed_length)
         
         # 如果前缀中的 valid prompts 数量满足要求，则可以早停
-        can_early_stop = valid_prompts_in_prefix >= min_valid_prompts
-        
-        return can_early_stop, continuous_completed_length
+        return valid_prompts_in_prefix >= min_valid_prompts, continuous_completed_length
 
     def _apply_fifo_selection(self, valid_prompt_indices: set, min_valid_prompts: int) -> set:
         """
@@ -1081,51 +1019,13 @@ class ChatCompletionScheduler:
         
         return set(selected_indices)
 
-    def _provide_default_conversation(self, batch_conversations: List[List[Dict[str, str]]], task_index: int):
-        """为未完成或失败的任务提供默认对话"""
-        if batch_conversations[task_index] is not None and len(batch_conversations[task_index]) > 0:
-            # 如果对话已经有内容但未完成，添加默认助手回复
-            if batch_conversations[task_index][-1].get("role") != "assistant":
-                batch_conversations[task_index].append({
-                    "role": "assistant", 
-                    "content": "",  # 空回复
-                    "score": 0.0,   # 默认分数
-                    "acc": 0.0,     # 默认准确度
-                    "pred": ""      # 默认预测
-                })
-            else:
-                # 如果最后一条是助手消息但缺少评分信息，添加默认评分
-                last_message = batch_conversations[task_index][-1]
-                if "score" not in last_message:
-                    last_message["score"] = 0.0
-                if "acc" not in last_message:
-                    last_message["acc"] = 0.0
-                if "pred" not in last_message:
-                    last_message["pred"] = ""
-        else:
-            # 如果对话为空，这通常不应该发生，但为了稳健性还是处理一下
-            logger.warning(f"Task {task_index} conversation is None or empty, this should not happen in normal cases")
-            # 由于我们无法知道原始的 raw_prompt，只能创建一个最小的默认结构
-            batch_conversations[task_index] = [
-                {"role": "user", "content": ""},
-                {"role": "assistant", "content": "", "score": 0.0, "acc": 0.0, "pred": ""}
-            ]
-
-    async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, sampling_params: Dict[str, Any], task_index: int, task_request_ids: Dict[int, str], task_server_addresses: Dict[int, str], address: str=None):
+    async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, sampling_params: Dict[str, Any], task_index: int, address: str=None):
         """Submit chat completion request to a specific server and wait for completion"""
-        done = asyncio.Event()
-
         info = {
-            "__done__": done,
             "__depth__": 0,  # indicate how many ongoing completion requests
             "__sampling_params__": sampling_params,
             "__task_index__": task_index,
-            "__task_request_ids__": task_request_ids,
-            "__task_server_addresses__": task_server_addresses,
         }
 
         # Use the unified submit_chat_completions method with specific address
-        self.submit_chat_completions(messages=messages, request_id=request_id, info=info, address=address)
-
-        # Wait until all completion requests are done
-        await done.wait()
+        await self._submit_chat_completions_and_callback(messages=messages, request_id=request_id, info=info, address=address)
