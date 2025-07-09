@@ -5,6 +5,7 @@ import logging
 from collections import defaultdict
 from typing import Any, Dict, List
 
+import datasets
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -12,8 +13,11 @@ from openai.types.chat.chat_completion import ChatCompletion
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
+from verl.utils.reward_score.math_dapo import compute_score as math_dapo_compute_score
 from verl.utils.torch_functional import pad_sequence_to_length
 from verl.workers.rollout.chat_scheduler import ChatCompletionScheduler, CompletionCallback
+
+# from .xverify import compute_score as xverify_compute_score
 
 logger = logging.getLogger(__file__)
 
@@ -22,17 +26,51 @@ class RewardCompletionCallback(CompletionCallback):
     def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
         super().__init__(config, scheduler)
         self.max_response_length = config.data.max_response_length
+        self.xverify_url = config.get("xverify_url", "http://localhost:8000")
         
         # 添加并发控制
-        self.max_concurrent_requests = config.get("max_concurrent_requests", 64)  # 默认最大10个并发
+        self.max_concurrent_requests = config.get("max_concurrent_requests", 128)  # 默认最大10个并发
         self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         self.max_retries = config.get("max_retries", 1)  # 最大重试次数
         self.retry_delay = config.get("retry_delay", 0.5)  # 重试延迟（秒）
         
-        print(f"[Callback] 数据集加载逻辑已移至 math_verify_service.py")
-        print(f"[Callback] 并发限制: {self.max_concurrent_requests}, 最大重试次数: {self.max_retries}")
+        # print(f"[Callback] 数据集加载逻辑已移至 math_verify_service.py")
+        # print(f"[Callback] 并发限制: {self.max_concurrent_requests}, 最大重试次数: {self.max_retries}")
 
         # TODO: add reward manager to calculate reward score once a sample finish
+        self.prompt_to_answer = {}
+        self.load_dataset()
+
+    def load_dataset(self):
+        """加载数据集并构建prompt到answer的映射"""
+        try:
+            print("正在加载 DAPO-Math-17k 数据集...")
+            ds = datasets.load_dataset('BytedTsinghua-SIA/DAPO-Math-17k', split='train')
+            
+            prompt2answer = {}
+            for example in ds:
+                prompt = example['prompt'][0]['content']
+                ground_truth = example["reward_model"]['ground_truth']
+                prompt2answer[prompt] = ground_truth
+
+            # 加载 AIME 2024 数据集
+            print("正在加载 AIME 2024 数据集...")
+            aime_ds = datasets.load_dataset("parquet", data_files=self.config.data.val_files[0], split='train')
+            for example in aime_ds:
+                prompt = example['prompt'][0]['content']
+                ground_truth = example["reward_model"]['ground_truth']
+                prompt2answer[prompt] = ground_truth
+            
+            self.prompt_to_answer = prompt2answer
+            print(f"成功加载 {len(self.prompt_to_answer)} 个问答对")
+            
+            # 打印前5个QA对进行验证
+            for i, (prompt, answer) in enumerate(list(self.prompt_to_answer.items())[:5]):
+                print(f"样例 {i}: {prompt[:50]}... -> {answer}")
+                
+        except Exception as e:
+            print(f"加载数据集失败: {e}")
+            self.prompt_to_answer = {}
 
     async def compute_score(self, solution_str, prompt):
         """调用 math_verify_service.py 中的评分函数计算分数，带并发控制和重试机制"""
@@ -84,8 +122,9 @@ class RewardCompletionCallback(CompletionCallback):
             message["pred"] = ""
             return
         
-        question = messages[1]["content"]
-        ret = await self.compute_score(message["content"], question)
+        question = messages[0]["content"]
+        # ret = await self.compute_score(message["content"], question)
+        ret = math_dapo_compute_score(message["content"], self.prompt_to_answer[question])
 
         message["score"] = ret["score"]
         message["acc"] = ret["acc"]

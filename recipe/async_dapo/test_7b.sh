@@ -4,8 +4,8 @@ set -euxo pipefail
 current_dir="$(dirname "$(readlink -f "$0")")"
 home_dir="${HOME_DIR:-"${PWD}"}"
 
-project_name='async_qwen2_5_7b_zero'
-exp_name='AsyncDAPO-Skywork-CustomTemplate'
+project_name='async_qwen3_8b_zero'
+exp_name='AsyncDAPO-DAPO'
 
 adv_estimator=grpo
 
@@ -19,7 +19,7 @@ clip_ratio_high=0.28
 
 max_prompt_length=$((1024))
 max_response_length=$((1024 * 8))
-enable_overlong_buffer=False
+enable_overlong_buffer=True
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
 
@@ -34,7 +34,7 @@ filter_groups_metric=acc
 max_num_gen_batches=20
 train_prompt_bsz=512
 gen_prompt_bsz=$((512 * 2))
-train_prompt_mini_bsz=64
+train_prompt_mini_bsz=32
 n_resp_per_prompt=16
 # for dynamic task creation, we will check the server load every batch_creation_interval seconds, 
 # and create tasks if the server load is less than max_concurrent_per_server
@@ -49,9 +49,9 @@ WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 
 # Paths
-MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-7B"}
+MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B-Base"}
 CKPTS_DIR=${CKPTS_DIR:-"${home_dir}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${home_dir}/data/skywork_or1_1_5b_diff_sys/train.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${home_dir}/data/dapo-math-17k.parquet"}
 
 # Algorithm
 temperature=1.0
@@ -66,7 +66,7 @@ offload=False
 
 python3 -m recipe.async_dapo.main_dapo \
     data.train_files="${TRAIN_FILE}" \
-    data.val_files="[$home_dir/data/aime24_sys/test.parquet]" \
+    data.val_files="[$home_dir/data/aime-2024.parquet]" \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.return_raw_chat=True \
