@@ -472,6 +472,7 @@ class RayDistillationTrainer(RayPPOTrainer):
                     # dummy some keys to keep compatibility
                     batch.batch["advantages"] = torch.zeros_like(batch.batch["responses"])
                     batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["responses"])
+                    batch.meta_info["temperature"] = 1.0
 
                     # update actor
                     with marked_timer("update_actor", timing_raw, color="red"):
