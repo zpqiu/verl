@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import json
 import logging
+import random
 from collections import defaultdict
 from typing import Any, Dict, List
 
@@ -125,6 +126,17 @@ class RewardCompletionCallback(CompletionCallback):
         question = messages[0]["content"]
         # ret = await self.compute_score(message["content"], question)
         ret = math_dapo_compute_score(message["content"], self.prompt_to_answer[question])
+
+        # print some samples
+        if random.randint(0, 512) < 2:
+            print("\n" + "="*80)
+            print("🔍 [调试样例]")
+            print("-"*80)
+            print(f"📝 问题: {question}")
+            print(f"🤖 模型回答: {message['content']}")
+            print(f"✅ 标准答案: {self.prompt_to_answer[question]}")
+            print(f"📊 评分结果: 分数={ret['score']:.2f} | 准确率={ret['acc']:.2f} | 预测={ret['pred']}")
+            print("="*80 + "\n")
 
         message["score"] = ret["score"]
         message["acc"] = ret["acc"]
