@@ -29,7 +29,7 @@ from verl.utils.device import is_cuda_available
 from .ray_trainer import RayDistillationTrainer
 
 
-@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="dapo_trainer", version_base=None)
 def main(config):
     """Main entry point for PPO training with Hydra configuration management.
 
