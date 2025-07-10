@@ -17,6 +17,7 @@ import importlib
 import itertools
 import json
 import logging
+import random
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -300,6 +301,7 @@ class UnifiedTaskStateManager:
         
         # 任务队列管理
         self.task_queue: asyncio.Queue = asyncio.Queue()
+        self.server_queue: asyncio.Queue = asyncio.Queue()
         self.task_creation_done: asyncio.Event = asyncio.Event()
         self.early_stop_signal: asyncio.Event = asyncio.Event()
     
@@ -359,12 +361,12 @@ class UnifiedTaskStateManager:
             
             # 打印完成信息
             if is_validation:
-                print(f"[Validation] Prompt {prompt_index} 完成 (已完成 {self.completed_prompts}/{self.num_prompts} 个)")
+                print(f"[Validation] Prompt {prompt_index} 完成 (已完成 {self.completed_prompts}/{self.num_prompts} 个) || Task 完成了 {len(self.completed_tasks)} 个")
             else:
                 if task_validity:
-                    print(f"[EarlyStop] Prompt {prompt_index} 完成且合法 (已完成 {self.completed_prompts}/{self.num_prompts} 个，合法 {self.valid_prompts} 个)")
+                    print(f"[EarlyStop] Prompt {prompt_index} 完成且合法 (已完成 {self.completed_prompts}/{self.num_prompts} 个，合法 {self.valid_prompts} 个) || Task 完成了 {len(self.completed_tasks)} 个")
                 else:
-                    print(f"[EarlyStop] Prompt {prompt_index} 完成但不合法 (方差为0) (已完成 {self.completed_prompts}/{self.num_prompts} 个，合法 {self.valid_prompts} 个)")
+                    print(f"[EarlyStop] Prompt {prompt_index} 完成但不合法 (方差为0) (已完成 {self.completed_prompts}/{self.num_prompts} 个，合法 {self.valid_prompts} 个) || Task 完成了 {len(self.completed_tasks)} 个")
         
         return task_info
 
@@ -449,8 +451,8 @@ class ChatCompletionScheduler:
         self.model_name = "/".join(model_path.split("/")[-2:])
 
         # Least requests load balancing
-        self.weighted_addresses = [[0, address] for address in server_addresses]
-        heapq.heapify(self.weighted_addresses)
+        # self.weighted_addresses = [[0, address] for address in server_addresses]
+        # heapq.heapify(self.weighted_addresses)
         self.server_addresses = server_addresses
 
         # LRU cache to map request_id to address
@@ -486,16 +488,15 @@ class ChatCompletionScheduler:
                 if request_id in self.request_id_to_address:
                     address = self.request_id_to_address.pop(request_id)
             else:
-                address = self.weighted_addresses[0][1]
-                self.weighted_addresses[0][0] += 1
-                heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
-
+                address = random.choice(self.server_addresses)
+        
         # use new request_id to avoid duplicate request_id problem
         request_id = uuid4().hex
         self.request_id_to_address[request_id] = address
 
         # 更新任务的 request_id 和 start_time
         task_index = info.get("__task_index__")
+        prompt_index = None
         if task_index is not None and hasattr(self, '_current_unified_task_manager') and self._current_unified_task_manager:
             # 找到对应的任务并更新信息
             if task_index in self._current_unified_task_manager.active_tasks:
@@ -504,17 +505,23 @@ class ChatCompletionScheduler:
                 task_info.start_time = time.time()
                 # 更新 request_id 到任务的映射
                 self._current_unified_task_manager.request_id_to_task[request_id] = task_index
+                prompt_index = task_info.prompt_index
 
         try:
             # NOTE: OpenAI client uses httpx, seems to have performance issue in high concurrency requests.
+            if random.random() < 0.01:
+                print(f"[ChatCompletionScheduler] request_id: {request_id}, will set priority: {prompt_index}")
             completions = await self._chat_completions_aiohttp(
                 address,
                 messages=messages,
                 tools=self.completion_callback.tool_schemas,
                 extra_body=self.completion_callback.extra_body,
                 extra_headers={"x-request-id": request_id},
+                priority=prompt_index if prompt_index is not None else 0,
                 **info["__sampling_params__"],
             )
+
+            await self.server_queue.put(address)
 
             await self.completion_callback(messages, completions, info)
             
@@ -529,7 +536,7 @@ class ChatCompletionScheduler:
                         self._current_unified_task_manager.update_task_reward(task_index, reward)
                         
         except Exception as e:
-            logger.exception(f"completion callback failed with exception: {e}")
+            print(f"[ChatCompletionScheduler] completion callback failed with exception: {e}")
 
     async def _chat_completions_aiohttp(self, address: str, **chat_complete_request) -> ChatCompletion:
         session = None
@@ -618,7 +625,7 @@ class ChatCompletionScheduler:
         
         # 启动动态任务创建器
         task_creator = asyncio.create_task(
-            self._dynamic_task_creator(
+            self._naive_task_creator(
                 batch_conversations=batch_conversations,
                 sampling_params=kwargs,
                 unified_task_manager=unified_task_manager,
@@ -643,6 +650,7 @@ class ChatCompletionScheduler:
 
         completed_prompts, valid_prompts, valid_prompt_indices = unified_task_manager.completed_prompts, unified_task_manager.valid_prompts, unified_task_manager.valid_prompt_indices
         
+        t_postprocess = time.time()
         if is_validation:
             print(f"[ChatCompletionScheduler] Validation completed: {completed_prompts}/{num_prompts} prompts processed")
             # 验证模式或所有 prompt 都合法时，不过滤
@@ -671,6 +679,7 @@ class ChatCompletionScheduler:
         
         output_batch.meta_info["timing"] = {
             "generate_sequences": time.time() - t_start,
+            "rollout_postprocess": time.time() - t_postprocess,
         }
         output_batch.meta_info["completed_prompts"] = completed_prompts
         output_batch.meta_info["valid_prompts"] = valid_prompts
@@ -814,6 +823,72 @@ class ChatCompletionScheduler:
                     logger.exception(f"Error calling abort_callback: {e}")
             
         return cancelled_request_ids_by_address
+
+    async def _naive_task_creator(self, batch_conversations: List[List[Dict[str, str]]], sampling_params: Dict[str, Any], unified_task_manager: UnifiedTaskStateManager):
+        """
+        朴素任务创建器：1. 先创建第一批任务，用 round-robin 方式创建；2. 然后从 server_queue 中获取地址，创建任务
+        """
+        total_tasks = len(batch_conversations)
+        created_tasks = 0
+        n = unified_task_manager.n
+        
+        # 默认配置
+        # batch_creation_interval = getattr(self.config, 'batch_creation_interval', 10)  # 批次创建间隔（秒）
+        max_concurrent_per_server = getattr(self.config, 'max_concurrent_per_server', 512)  # 每个服务器最大并发数
+
+        print(f"[TaskCreator] 开始朴素创建 {total_tasks} 个任务")
+        task_num_first_round = max_concurrent_per_server * len(self.server_addresses)
+
+        # 创建第一批任务
+        for i in range(task_num_first_round):
+            if unified_task_manager.early_stop_signal.is_set():
+                print(f"[TaskCreator] 收到早停信号，停止创建任务。已创建 {created_tasks}/{total_tasks} 个任务")
+                break
+            if created_tasks >= total_tasks:
+                break
+            batch_index = created_tasks
+            prompt_index = batch_index // n
+            task_offset = batch_index % n
+            server_address = self.server_addresses[i % len(self.server_addresses)]
+            task_info = TaskInfo(
+                task_index=batch_index,
+                prompt_index=prompt_index,
+                task_offset=task_offset,
+                server_address=server_address,
+                request_id=None,  # 将在 _submit_chat_completions_and_callback 中设置
+                start_time=None,  # 将在任务开始时设置
+            )
+            unified_task_manager.add_task(task_info)
+            created_tasks += 1
+
+        while created_tasks < total_tasks:
+            # 检查早停信号
+            if unified_task_manager.early_stop_signal.is_set():
+                print(f"[TaskCreator] 收到早停信号，停止创建任务。已创建 {created_tasks}/{total_tasks} 个任务")
+                break
+
+            # 从 server_queue 中获取地址
+            server_address = await self.server_queue.get()
+
+            batch_index = created_tasks
+            prompt_index = batch_index // n
+            task_offset = batch_index % n
+            
+            # 创建任务信息并添加到统一任务管理器
+            task_info = TaskInfo(
+                task_index=batch_index,
+                prompt_index=prompt_index,
+                task_offset=task_offset,
+                server_address=server_address,
+                request_id=None,  # 将在 _submit_chat_completions_and_callback 中设置
+                start_time=None,  # 将在任务开始时设置
+            )
+            unified_task_manager.add_task(task_info)
+            
+            created_tasks += 1
+            
+        # set task creation done
+        unified_task_manager.task_creation_done.set()
 
     async def _dynamic_task_creator(self, batch_conversations: List[List[Dict[str, str]]], sampling_params: Dict[str, Any], unified_task_manager: UnifiedTaskStateManager):
         """
