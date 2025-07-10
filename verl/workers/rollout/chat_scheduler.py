@@ -496,7 +496,7 @@ class ChatCompletionScheduler:
 
         # 更新任务的 request_id 和 start_time
         task_index = info.get("__task_index__")
-        prompt_index = None
+        # prompt_index = None
         if task_index is not None and hasattr(self, '_current_unified_task_manager') and self._current_unified_task_manager:
             # 找到对应的任务并更新信息
             if task_index in self._current_unified_task_manager.active_tasks:
@@ -505,23 +505,23 @@ class ChatCompletionScheduler:
                 task_info.start_time = time.time()
                 # 更新 request_id 到任务的映射
                 self._current_unified_task_manager.request_id_to_task[request_id] = task_index
-                prompt_index = task_info.prompt_index
+                # prompt_index = task_info.prompt_index
 
         try:
             # NOTE: OpenAI client uses httpx, seems to have performance issue in high concurrency requests.
-            if random.random() < 0.01:
-                print(f"[ChatCompletionScheduler] request_id: {request_id}, will set priority: {prompt_index}")
+            # if random.random() < 0.01:
+            #     print(f"[ChatCompletionScheduler] request_id: {request_id}, will set priority: {prompt_index}")
             completions = await self._chat_completions_aiohttp(
                 address,
                 messages=messages,
                 tools=self.completion_callback.tool_schemas,
                 extra_body=self.completion_callback.extra_body,
                 extra_headers={"x-request-id": request_id},
-                priority=prompt_index if prompt_index is not None else 0,
+                # priority=prompt_index if prompt_index is not None else 0,
                 **info["__sampling_params__"],
             )
 
-            await self.server_queue.put(address)
+            await self._current_unified_task_manager.server_queue.put(address)
 
             await self.completion_callback(messages, completions, info)
             
@@ -859,6 +859,21 @@ class ChatCompletionScheduler:
                 start_time=None,  # 将在任务开始时设置
             )
             unified_task_manager.add_task(task_info)
+
+            # 创建任务，指定使用当前服务器
+            task = asyncio.create_task(
+                self._submit_chat_completions_semaphore(
+                    messages=batch_conversations[batch_index],
+                    request_id=None,
+                    sampling_params=sampling_params,
+                    task_index=batch_index,
+                    address=server_address,
+                )
+            )
+            
+            # 为任务添加索引信息
+            task._task_index = batch_index
+            await unified_task_manager.task_queue.put(task)
             created_tasks += 1
 
         while created_tasks < total_tasks:
@@ -868,7 +883,7 @@ class ChatCompletionScheduler:
                 break
 
             # 从 server_queue 中获取地址
-            server_address = await self.server_queue.get()
+            server_address = await unified_task_manager.server_queue.get()
 
             batch_index = created_tasks
             prompt_index = batch_index // n
@@ -884,7 +899,21 @@ class ChatCompletionScheduler:
                 start_time=None,  # 将在任务开始时设置
             )
             unified_task_manager.add_task(task_info)
+
+            # 创建任务，指定使用当前服务器
+            task = asyncio.create_task(
+                self._submit_chat_completions_semaphore(
+                    messages=batch_conversations[batch_index],
+                    request_id=None,
+                    sampling_params=sampling_params,
+                    task_index=batch_index,
+                    address=server_address,
+                )
+            )
             
+            # 为任务添加索引信息
+            task._task_index = batch_index
+            await unified_task_manager.task_queue.put(task)
             created_tasks += 1
             
         # set task creation done
