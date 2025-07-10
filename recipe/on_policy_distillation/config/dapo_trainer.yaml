@@ -1,0 +1,25 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  ref:
+    model:
+      path: null
+      override_config:
+        attention_dropout: 0.0
+        embd_pdrop: 0.0
+        resid_pdrop: 0.0
+
+  actor:
+    policy_loss:
+      loss_mode: "gpg"
+    use_kl_loss: true
+    # KL loss coefficient when use_kl_loss is enabled. For GRPO
+    kl_loss_coef: 1.0
+    # Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full"
+    kl_loss_type: low_var_kl
