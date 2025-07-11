@@ -470,8 +470,12 @@ class RayDistillationTrainer(RayPPOTrainer):
                         batch = batch.union(ref_log_prob)
 
                     # dummy some keys to keep compatibility
-                    batch.batch["advantages"] = torch.zeros_like(batch.batch["responses"])
-                    batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["responses"])
+                    batch.batch["advantages"] = torch.zeros_like(batch.batch["responses"]).float()
+                    batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["responses"]).float()
+                    batch.batch["token_level_scores"] = torch.zeros_like(batch.batch["responses"]).float()
+                    batch.batch["token_level_rewards"] = torch.zeros_like(batch.batch["responses"]).float()
+                    batch.batch["returns"] = torch.zeros_like(batch.batch["responses"]).float()
+                    # batch.batch["values"] = torch.zeros_like(batch.batch["responses"])
                     batch.meta_info["temperature"] = 1.0
 
                     # update actor
@@ -576,3 +580,4 @@ class RayDistillationTrainer(RayPPOTrainer):
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
