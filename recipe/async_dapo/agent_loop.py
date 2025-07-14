@@ -156,10 +156,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
         response_mask = [1] * len(response_ids)
 
-        response_str = self.tokenizer.decode(response_ids[: self.response_length], skip_special_tokens=True)
-        eos_token = self.tokenizer.eos_token
-        if response_str.endswith(eos_token):
-            response_str = response_str[: -len(eos_token)]
+        # response_str = self.tokenizer.decode(response_ids[: self.response_length], skip_special_tokens=True)
+        # eos_token = self.tokenizer.eos_token
+        # if response_str.endswith(eos_token):
+        #     response_str = response_str[: -len(eos_token)]
 
         # ret = self.reward_fn(response_str)
 
@@ -311,10 +311,27 @@ class AgentLoopWorker:
         
         ground_truth = self.prompt_to_answer.get(question, question)
         response_str = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
+        
+        ori_response_str = response_str
+
+        eos_token = self.tokenizer.eos_token
+        if response_str.endswith(eos_token):
+            response_str = response_str[: -len(eos_token)]
         ret = compute_score(response_str, ground_truth)
         reward = ret["score"]
         acc = ret["acc"]
         pred = ret["pred"]
+
+        # print some samples
+        if random.randint(0, 512) < 2:
+            print("\n" + "="*80)
+            print("🔍 [调试样例]")
+            print("-"*80)
+            print(f"📝 问题: {question}")
+            print(f"🤖 模型回答: {ori_response_str}")
+            print(f"✅ 标准答案: {ground_truth}")
+            print(f"📊 评分结果: 分数={reward:.2f} | 准确率={acc:.2f} | 预测={pred}")
+            print("="*80 + "\n")
 
         if self.config.actor_rollout_ref.rollout.overlong_buffer.enable:
             overlong_buffer_len = self.config.actor_rollout_ref.rollout.overlong_buffer.len
@@ -322,6 +339,7 @@ class AgentLoopWorker:
             exceed_len = len(output.response_ids) - expected_len
             overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer.penalty_factor
             overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+            # print(f"[AgentLoop][DEBUG] reward: {reward}, response_len: {len(output.response_ids)}, overlong_buffer_len: {overlong_buffer_len}, exceed_len: {exceed_len}, overlong_penalty_factor: {overlong_penalty_factor}, overlong_reward: {overlong_reward}")
             reward += overlong_reward
         
         return RewardOutput(reward=reward, acc=acc, pred=pred)
@@ -379,7 +397,7 @@ class AgentLoopWorker:
         reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32)
         reward_extra_info = defaultdict(list)
         for i, input in enumerate(inputs):
-            reward_tensor[i, :valid_response_lengths[i]] = input.reward.reward
+            reward_tensor[i, valid_response_lengths[i]-1] = input.reward.reward
             reward_extra_info["acc"].append(input.reward.acc)
             reward_extra_info["pred"].append(input.reward.pred)
             reward_extra_info["score"].append(input.reward.reward)
