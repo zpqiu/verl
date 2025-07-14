@@ -153,6 +153,8 @@ class AgentLoopWorker:
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
 
         trace_config = config.trainer.get("rollout_trace", {})
+        self.prompt_to_answer = {}
+        self._load_dataset()
 
         RolloutTraceConfig.init(
             config.trainer.project_name,
@@ -274,11 +276,11 @@ class AgentLoopWorker:
         acc = ret["acc"]
         pred = ret["pred"]
 
-        if self.config.actor_rollout_ref.rollout.overlong_buffer_cfg.enable:
-            overlong_buffer_len = self.config.actor_rollout_ref.rollout.overlong_buffer_cfg.len
+        if self.config.actor_rollout_ref.rollout.overlong_buffer.enable:
+            overlong_buffer_len = self.config.actor_rollout_ref.rollout.overlong_buffer.len
             expected_len = self.config.actor_rollout_ref.rollout.response_length - overlong_buffer_len
             exceed_len = len(response_str) - expected_len
-            overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer_cfg.penalty_factor
+            overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer.penalty_factor
             overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
             reward += overlong_reward
         
