@@ -18,6 +18,7 @@ import os
 import random
 from collections import defaultdict
 from typing import Any
+from uuid import uuid4
 
 import datasets
 import numpy as np
@@ -29,16 +30,16 @@ from pydantic import BaseModel
 from tensordict import TensorDict
 from transformers import AutoTokenizer
 
+from verl.experimental.agent_loop.agent_loop import AgentLoopBase
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
+from verl.utils.profiler import simple_timer
 from verl.utils.reward_score.math_dapo import compute_score
 from verl.utils.rollout_trace import (RolloutTraceConfig, rollout_trace_attr,
                                       rollout_trace_op)
 from verl.workers.rollout.async_server import async_server_class
-
-from .reward_agent_loop import SingleTurnAgentLoop
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -132,6 +133,45 @@ class AgentLoopOutput(BaseModel):
     metrics: AgentLoopMetrics
     reward: RewardOutput = RewardOutput()
 
+
+class SingleTurnAgentLoop(AgentLoopBase):
+    """Naive agent loop that only do single turn chat completion."""
+
+    def __init__(self, config, server_manager, tokenizer):
+        super().__init__(config, server_manager, tokenizer)
+        self.prompt_length = config.actor_rollout_ref.rollout.prompt_length
+        self.response_length = config.actor_rollout_ref.rollout.response_length
+        # self.reward_fn = reward_fn
+
+    async def run(self, messages: list[dict[str, Any]], sampling_params: dict[str, Any]) -> AgentLoopOutput:
+        metrics = {}
+        request_id = uuid4().hex
+        prompt_ids = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        )
+
+        with simple_timer("generate_sequences", metrics):
+            response_ids = await self.server_manager.generate(
+                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
+            )
+        response_mask = [1] * len(response_ids)
+
+        response_str = self.tokenizer.decode(response_ids[: self.response_length], skip_special_tokens=True)
+        eos_token = self.tokenizer.eos_token
+        if response_str.endswith(eos_token):
+            response_str = response_str[: -len(eos_token)]
+
+        # ret = self.reward_fn(response_str)
+
+        output = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids[: self.response_length],
+            response_mask=response_mask[: self.response_length],
+            num_turns=2,
+            metrics=metrics,
+            # reward=ret,
+        )
+        return output
 
 @ray.remote
 class AgentLoopWorker:
@@ -279,7 +319,7 @@ class AgentLoopWorker:
         if self.config.actor_rollout_ref.rollout.overlong_buffer.enable:
             overlong_buffer_len = self.config.actor_rollout_ref.rollout.overlong_buffer.len
             expected_len = self.config.actor_rollout_ref.rollout.response_length - overlong_buffer_len
-            exceed_len = len(response_str) - expected_len
+            exceed_len = len(output.response_ids) - expected_len
             overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer.penalty_factor
             overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
             reward += overlong_reward
