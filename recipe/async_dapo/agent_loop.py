@@ -16,6 +16,7 @@ import heapq
 import logging
 import os
 import random
+import threading
 from collections import defaultdict
 from typing import Any
 from uuid import uuid4
@@ -45,42 +46,103 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-class AsyncLLMServerManager:
+@ray.remote(concurrency_groups={"acquire": 1, "release": 10})
+class GlobalLoadBalancer:
     """
-    A class to manage multiple OpenAI compatible LLM servers. This class provides
-    - Load balance: least requests load balancing
-    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+    全局负载均衡器，只负责分配服务器索引，不处理实际的generate调用
+    使用 threading.Semaphore 而不是 asyncio.Queue 来避免 Ray Actor 中的并发问题
     """
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], max_cache_size: int = 10000):
-        """Initialize the AsyncLLMServerManager.
+    def __init__(self, config: DictConfig, num_servers: int, max_cache_size: int = 10000):
+        """Initialize the GlobalLoadBalancer.
 
         Args:
             config (DictConfig): YAML config.
-            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            num_servers (int): 服务器数量
             max_cache_size (int, optional): max cache size for request_id to server mapping. Defaults to 10000.
         """
         self.config = config
-        self.server_handles = server_handles
-        random.shuffle(self.server_handles)
+        self.num_servers = num_servers
+
+        # 使用 threading.Semaphore 替代 asyncio.Queue
+        max_loads_per_server = 300
+        total_capacity = max_loads_per_server * num_servers
+        self._semaphore = threading.Semaphore(total_capacity)
+        self._current_loads = [0] * num_servers  # 跟踪每个服务器的当前负载
+        self._lock = threading.Lock()  # 保护 _current_loads 的并发访问
+        
+        print(f"[GlobalLoadBalancer] max_loads_per_server: {max_loads_per_server}")
+        print(f"[GlobalLoadBalancer] total_capacity: {total_capacity}")
 
         # Least requests load balancing
-        self.weighted_serveres = [[0, (hash(server), server)] for server in server_handles]
+        self.weighted_serveres = [[0, server_index] for server_index in range(num_servers)]
         heapq.heapify(self.weighted_serveres)
 
         # LRU cache to map request_id to server
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
-    def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
-        # TODO: implement server pressure awareness load balancing
+    @ray.method(concurrency_group="acquire")
+    def get_server_index(self, request_id: str) -> int:
+        """获取应该使用的服务器索引"""
+        if self.config.actor_rollout_ref.rollout.get("load_balance", False):
+            # 获取信号量许可
+            self._semaphore.acquire()
+            
+            # 选择负载最少的服务器
+            with self._lock:
+                min_load_idx = min(range(self.num_servers), key=lambda i: self._current_loads[i])
+                self._current_loads[min_load_idx] += 1
+                server_index = min_load_idx
+                
+            if random.random() < 0.01:  # 1% 概率打印日志，增加可见性
+                print(f"[GlobalLoadBalancer] choose server: {server_index}, request_id: {request_id}, current_loads: {self._current_loads}")
+            return server_index
+        else:
+            return self._choose_server_index(request_id)
+
+    @ray.method(concurrency_group="release")
+    def release_server_index(self, server_index: int):
+        """释放服务器索引"""
+        if self.config.actor_rollout_ref.rollout.get("load_balance", False):
+            # 减少服务器负载计数
+            with self._lock:
+                if self._current_loads[server_index] > 0:
+                    self._current_loads[server_index] -= 1
+                    
+            # 释放信号量许可
+            self._semaphore.release()
+            
+            if random.random() < 0.01:  # 1% 概率打印日志，增加可见性
+                print(f"[GlobalLoadBalancer] release server: {server_index}, current_loads: {self._current_loads}")
+
+    def _choose_server_index(self, request_id: str) -> int:
         if request_id in self.request_id_to_server:
             return self.request_id_to_server[request_id]
 
-        server = self.weighted_serveres[0][1][1]
+        server_index = self.weighted_serveres[0][1]
         self.weighted_serveres[0][0] += 1
         heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
-        self.request_id_to_server[request_id] = server
-        return server
+        self.request_id_to_server[request_id] = server_index
+        return server_index
+
+
+class AsyncLLMServerManager:
+    """
+    本地服务器管理器，负责实际的generate调用
+    通过全局负载均衡器获取服务器分配
+    """
+
+    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], global_load_balancer: ray.actor.ActorHandle):
+        """Initialize the AsyncLLMServerManager.
+
+        Args:
+            config (DictConfig): YAML config.
+            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            global_load_balancer (ray.actor.ActorHandle): 全局负载均衡器的handle
+        """
+        self.config = config
+        self.server_handles = server_handles
+        self.global_load_balancer = global_load_balancer
 
     @rollout_trace_op
     async def generate(
@@ -100,12 +162,20 @@ class AsyncLLMServerManager:
         Returns:
             List[int]: List of generated token ids.
         """
-        server = self._choose_server(request_id)
-        output = await server.generate.remote(
-            request_id=request_id,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-        )
+        # 从全局负载均衡器获取服务器索引（现在是同步调用）
+        server_index = await self.global_load_balancer.get_server_index.remote(request_id)
+        server = self.server_handles[server_index]
+        
+        try:
+            output = await server.generate.remote(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+            )
+        finally:
+            # 确保释放服务器索引，即使出现异常（现在是同步调用）
+            await self.global_load_balancer.release_server_index.remote(server_index)
+        
         return output
 
 
@@ -177,15 +247,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle]):
+    def __init__(self, config: DictConfig, global_load_balancer: ray.actor.ActorHandle, server_handles: list[ray.actor.ActorHandle]):
         """Initialize agent loop manager.
 
         Args:
             config (DictConfig): YAML config.
+            global_load_balancer (ray.actor.ActorHandle): 全局负载均衡器的handle
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
         """
         self.config = config
-        self.server_manager = AsyncLLMServerManager(config, server_handles)
+        # 创建本地的服务器管理器，使用全局负载均衡器
+        self.server_manager = AsyncLLMServerManager(config, server_handles, global_load_balancer)
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -278,7 +350,7 @@ class AgentLoopWorker:
         """加载数据集并构建prompt到answer的映射"""
         try:
             print("正在加载 DAPO-Math-17k 数据集...")
-            ds = datasets.load_dataset('BytedTsinghua-SIA/DAPO-Math-17k', split='train')
+            ds = datasets.load_dataset("parquet", data_files=self.config.data.train_files, split='train')
             
             prompt2answer = {}
             for example in ds:
@@ -288,7 +360,8 @@ class AgentLoopWorker:
 
             # 加载 AIME 2024 数据集
             print("正在加载 AIME 2024 数据集...")
-            aime_ds = datasets.load_dataset("parquet", data_files=self.config.data.val_files[0], split='train')
+            print(self.config.data.val_files)
+            aime_ds = datasets.load_dataset("parquet", data_files=[self.config.data.val_files[0]], split='train')
             for example in aime_ds:
                 prompt = example['prompt'][0]['content']
                 ground_truth = example["reward_model"]['ground_truth']
@@ -453,6 +526,7 @@ class AgentLoopManager:
         self.worker_group = worker_group
 
         self._initialize_llm_servers()
+        self._init_global_server_manager()
         self._init_agent_loop_workers()
 
         # Initially we're in sleep mode.
@@ -506,14 +580,22 @@ class AgentLoopManager:
         # All server instances are ready, init AsyncLLM engine.
         ray.get([server.init_engine.remote() for server in self.async_llm_servers])
 
+    def _init_global_server_manager(self):
+        """创建全局的AsyncLLMServerManager作为Ray Actor"""
+        self.global_load_balancer = GlobalLoadBalancer.options(
+            name="global_async_llm_load_balancer",
+        ).remote(self.config, self.rollout_dp_size)
+        print("[AgentLoopManager] 创建了全局负载均衡器")
+
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         for i in range(self.config.actor_rollout_ref.rollout.agent.num_workers):
             self.agent_loop_workers.append(
                 AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
-                ).remote(self.config, self.async_llm_servers)
+                ).remote(self.config, self.global_load_balancer, self.async_llm_servers)
             )
+        print(f"[AgentLoopManager] 创建了 {len(self.agent_loop_workers)} 个AgentLoopWorker，都使用同一个全局服务器管理器")
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
