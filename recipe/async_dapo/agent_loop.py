@@ -46,6 +46,53 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@ray.remote
+class EarlyStoppingCoordinator:
+    """协调早停机制的全局状态管理器"""
+    
+    def __init__(self, expected_prompt_num: int, samples_per_prompt: int):
+        self.expected_prompt_num = expected_prompt_num
+        self.samples_per_prompt = samples_per_prompt
+        self.completed_prompts = set()  # 已完成的prompt sample_index集合
+        self.should_stop = False
+        self.lock = threading.Lock()
+        print(f"[EarlyStoppingCoordinator] 初始化: expected_prompt_num={expected_prompt_num}, samples_per_prompt={samples_per_prompt}")
+    
+    def report_completion(self, sample_index: int) -> bool:
+        """报告某个prompt的完成状态
+        
+        Args:
+            sample_index: 完成的prompt的sample_index
+            
+        Returns:
+            bool: 是否应该触发早停
+        """
+        with self.lock:
+            if self.should_stop:
+                return True
+                
+            self.completed_prompts.add(sample_index)
+            completed_count = len(self.completed_prompts)
+            
+            if completed_count >= self.expected_prompt_num:
+                self.should_stop = True
+                print(f"[EarlyStoppingCoordinator] 触发早停: {completed_count}/{self.expected_prompt_num} prompts 已完成")
+                return True
+            else:
+                print(f"[EarlyStoppingCoordinator] 进度更新: {completed_count}/{self.expected_prompt_num} prompts 已完成")
+                return False
+    
+    def should_stop_generation(self) -> bool:
+        """检查是否应该停止生成"""
+        with self.lock:
+            return self.should_stop
+    
+    def get_completed_prompts(self) -> set:
+        """获取已完成的prompt集合"""
+        with self.lock:
+            return self.completed_prompts.copy()
+
+
 @ray.remote(concurrency_groups={"acquire": 1, "release": 10})
 class GlobalLoadBalancer:
     """
@@ -195,7 +242,7 @@ class RewardOutput(BaseModel):
 
 class AgentLoopOutput(BaseModel):
     """Agent loop output."""
-
+    rollout_index: int = -1
     prompt_ids: list[int]
     response_ids: list[int]
     response_mask: list[int]
@@ -258,6 +305,7 @@ class AgentLoopWorker:
         self.config = config
         # 创建本地的服务器管理器，使用全局负载均衡器
         self.server_manager = AsyncLLMServerManager(config, server_handles, global_load_balancer)
+        self.early_stopping_coordinator = None  # 早停协调器，在generate_sequences时设置
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -275,11 +323,12 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
         )
 
-    async def generate_sequences(self, batch: DataProto) -> DataProto:
-        """Generate sequences from agent loop.
+    async def generate_sequences(self, batch: DataProto, early_stopping_coordinator: ray.actor.ActorHandle = None) -> DataProto:
+        """Generate sequences from agent loop with early stopping support.
 
         Args:
             batch (DataProto): Input batch.
+            early_stopping_coordinator: 早停协调器
 
         Returns:
             DataProto: Output batch.
@@ -296,6 +345,8 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        self.early_stopping_coordinator = early_stopping_coordinator
+        
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -312,24 +363,140 @@ class AgentLoopWorker:
         if "agent_name" not in batch.non_tensor_batch:
             batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
 
-        tasks = []
         agent_names = batch.non_tensor_batch["agent_name"]
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
         else:
             index = np.arange(len(raw_prompts))
+        rollout_index = batch.non_tensor_batch["rollout_index"]
 
-        trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index)
+        trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index, rollout_index)
 
-        for agent_name, messages, trajectory in zip(agent_names, raw_prompts, trajectory_info, strict=True):
-            tasks.append(
-                asyncio.create_task(self._run_agent_loop(agent_name, messages.tolist(), sampling_params, trajectory))
+        # 按prompt分组任务，便于早停管理
+        prompt_groups = self._group_by_prompt(agent_names, raw_prompts, trajectory_info, sampling_params)
+        
+        # 为每个prompt创建一个任务组
+        prompt_tasks = {}
+        for sample_index, group_data in prompt_groups.items():
+            prompt_tasks[sample_index] = asyncio.create_task(
+                self._run_prompt_group(sample_index, group_data)
             )
+
+        # 等待任务完成或早停
+        completed_outputs = {}
+        pending_tasks = set(prompt_tasks.values())
+        
+        while pending_tasks:
+            # 检查早停状态
+            if early_stopping_coordinator:
+                should_stop = await early_stopping_coordinator.should_stop_generation.remote()
+                if should_stop:
+                    print(f"[AgentLoopWorker] 检测到早停信号，取消剩余 {len(pending_tasks)} 个任务")
+                    # 取消所有待处理任务
+                    for task in pending_tasks:
+                        task.cancel()
+                    break
+            
+            # 等待任意一个任务完成
+            done, pending_tasks = await asyncio.wait(
+                pending_tasks, 
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=0.1  # 短暂超时以便定期检查早停状态
+            )
+            
+            # 处理已完成的任务
+            for task in done:
+                try:
+                    sample_index, outputs = await task
+                    if not outputs:
+                        print(f"[AgentLoopWorker] Prompt {sample_index} 完成，但是 invalid")
+                        continue
+                    completed_outputs[sample_index] = outputs
+                    
+                    # 向协调器报告完成状态
+                    if early_stopping_coordinator:
+                        await early_stopping_coordinator.report_completion.remote(sample_index)
+                        
+                except asyncio.CancelledError:
+                    print(f"[AgentLoopWorker] 任务被取消")
+                except Exception as e:
+                    print(f"[AgentLoopWorker] 任务执行失败: {e}")
+        
+        # 只处理已完成的输出
+        if not completed_outputs:
+            # 如果没有完成的输出，返回空结果
+            return self._create_empty_output()
+            
+        all_outputs = []
+        for sample_index in sorted(completed_outputs.keys()):
+            all_outputs.extend(completed_outputs[sample_index])
+
+        output = self._postprocess(all_outputs)
+        return output
+
+    def _group_by_prompt(self, agent_names, raw_prompts, trajectory_info, sampling_params):
+        """按prompt sample_index分组数据"""
+        prompt_groups = defaultdict(list)
+        
+        for i, (agent_name, messages, trajectory) in enumerate(zip(agent_names, raw_prompts, trajectory_info, strict=True)):
+            sample_index = trajectory["sample_index"]
+            prompt_groups[sample_index].append({
+                "agent_name": agent_name,
+                "messages": messages.tolist(),
+                "trajectory": trajectory,
+                "sampling_params": sampling_params
+            })
+        
+        return prompt_groups
+
+    async def _run_prompt_group(self, sample_index: int, group_data: list):
+        """运行一个prompt的所有样本"""
+        tasks = []
+        for data in group_data:
+            task = asyncio.create_task(
+                self._run_agent_loop(
+                    data["agent_name"], 
+                    data["messages"], 
+                    data["sampling_params"], 
+                    data["trajectory"]
+                )
+            )
+            tasks.append(task)
+        
+        # 等待所有样本完成
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs)
-        return output
+        # 检查是否所有样本的 reward.reward 完全一样，如果一样，则该 prompt 为 invalid
+        if all(output.reward.reward == outputs[0].reward.reward for output in outputs):
+            return sample_index, []
+        
+        return sample_index, outputs
+
+    def _create_empty_output(self):
+        """创建空的输出结果"""
+        prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
+        response_length = self.config.actor_rollout_ref.rollout.response_length
+        
+        # 创建空的tensor
+        empty_batch = TensorDict(
+            {
+                "prompts": torch.empty((0, prompt_length), dtype=torch.long),
+                "responses": torch.empty((0, response_length), dtype=torch.long),
+                "response_mask": torch.empty((0, response_length), dtype=torch.long),
+                "input_ids": torch.empty((0, prompt_length + response_length), dtype=torch.long),
+                "attention_mask": torch.empty((0, prompt_length + response_length), dtype=torch.long),
+                "position_ids": torch.empty((0, prompt_length + response_length), dtype=torch.long),
+                "token_level_scores": torch.empty((0, response_length), dtype=torch.float32),
+            },
+            batch_size=0,
+        )
+        
+        return DataProto(
+            batch=empty_batch, 
+            non_tensor_batch={"__num_turns__": np.array([], dtype=np.int32)}, 
+            meta_info={"metrics": []}
+        )
 
     async def _run_agent_loop(
         self,
@@ -344,6 +511,7 @@ class AgentLoopWorker:
             agent_loop = SingleTurnAgentLoop(self.config, self.server_manager, self.tokenizer)
             output = await agent_loop.run(messages, sampling_params)
             output.reward = self._compute_reward(messages[0]["content"], output)
+            output.rollout_index = trajectory["rollout_index"]
             return output
         
     def _load_dataset(self):
@@ -489,9 +657,11 @@ class AgentLoopWorker:
         )
 
         num_turns = np.array([input.num_turns for input in inputs], dtype=np.int32)
+        rollout_index = np.array([input.rollout_index for input in inputs], dtype=np.int32)
         metrics = [input.metrics.model_dump() for input in inputs]
         non_tensor_batch = {
             "__num_turns__": num_turns,
+            "rollout_index": rollout_index,
         }
         for key, value in reward_extra_info.items():
             non_tensor_batch[key] = np.array(value)
@@ -499,7 +669,7 @@ class AgentLoopWorker:
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": metrics})
 
 
-async def get_trajectory_info(step, index):
+async def get_trajectory_info(step, index, rollout_index):
     """Get the trajectory info (step, sample_index, rollout_n) asynchrously"""
     trajectory_info = []
     rollout_n = 0
@@ -508,7 +678,7 @@ async def get_trajectory_info(step, index):
             rollout_n += 1
         else:
             rollout_n = 0
-        trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n})
+        trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n, "rollout_index": rollout_index[i]})
     return trajectory_info
 
 
@@ -597,34 +767,113 @@ class AgentLoopManager:
             )
         print(f"[AgentLoopManager] 创建了 {len(self.agent_loop_workers)} 个AgentLoopWorker，都使用同一个全局服务器管理器")
 
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Split input batch and dispatch to agent loop workers.
+    def generate_sequences(self, prompts: DataProto, expected_prompt_num: int = None) -> tuple[DataProto, set]:
+        """Split input batch and dispatch to agent loop workers with early stopping support.
 
         Args:
             prompts (DataProto): Input batch.
+            expected_prompt_num (int, optional): 期望完成的prompt数量，达到后触发早停
 
         Returns:
-            DataProto: Output batch.
+            tuple[DataProto, set]: (Output batch, set of completed sample indices)
         """
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
+
+        # 创建早停协调器（如果需要）
+        early_stopping_coordinator = None
+        if expected_prompt_num is not None:
+            samples_per_prompt = self.config.actor_rollout_ref.rollout.get("samples_per_prompt", 1)
+            early_stopping_coordinator = EarlyStoppingCoordinator.options(
+                name=f"early_stopping_coordinator_{uuid4().hex[:8]}"
+            ).remote(expected_prompt_num, samples_per_prompt)
+            print(f"[AgentLoopManager] 启用早停机制: expected_prompt_num={expected_prompt_num}")
+
+        # 按prompt分组并分配给workers，确保同一prompt的样本在同一worker
+        worker_chunks = self._split_by_prompt(prompts)
+        
+        # 启动所有worker任务
+        worker_tasks = []
+        for i, chunk in enumerate(worker_chunks):
+            if chunk is not None and len(chunk) > 0:  # 只处理非空chunk
+                task = self.agent_loop_workers[i].generate_sequences.remote(chunk, early_stopping_coordinator)
+                worker_tasks.append(task)
+            else:
+                worker_tasks.append(None)
+
+        # 等待所有worker完成
+        outputs = []
+        for i, task in enumerate(worker_tasks):
+            if task is not None:
+                try:
+                    result = ray.get(task)
+                    outputs.append(result)
+                except Exception as e:
+                    print(f"[AgentLoopManager] Worker {i} 执行失败: {e}")
+                    # 尽早抛出异常，避免后续的计算
+                    raise e
+
+        # 合并输出
         output = DataProto.concat(outputs)
+
+        # 获取完成的prompt集合
+        completed_prompts = set()
+        if early_stopping_coordinator is not None:
+            try:
+                completed_prompts = ray.get(early_stopping_coordinator.get_completed_prompts.remote())
+                print(f"[AgentLoopManager] 早停结束，完成了 {len(completed_prompts)} 个prompts")
+                ray.kill(early_stopping_coordinator)
+            except Exception:
+                pass
+
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
 
         # calculate performance metrics
-        metrics = [output.meta_info["metrics"] for output in outputs]  # List[List[Dict[str, str]]]
-        timing = self._performance_metrics(metrics, output)
+        if len(outputs) > 0:
+            metrics = [output.meta_info["metrics"] for output in outputs]  # List[List[Dict[str, str]]]
+            timing = self._performance_metrics(metrics, output)
+        else:
+            timing = {}
 
         output.meta_info = {"timing": timing}
         return output
+
+    def _split_by_prompt(self, prompts: DataProto) -> list:
+        """按prompt分组并分配给workers，确保同一prompt的样本分配到同一worker"""
+        # 获取sample_index信息
+        if "index" in prompts.non_tensor_batch:
+            indices = prompts.non_tensor_batch["index"]
+        else:
+            indices = np.arange(len(prompts))
+        
+        # 按sample_index分组
+        prompt_groups = defaultdict(list)
+        for i, sample_index in enumerate(indices):
+            prompt_groups[sample_index].append(i)
+        
+        # 分配给workers
+        num_workers = len(self.agent_loop_workers)
+        worker_assignments = [[] for _ in range(num_workers)]
+        
+        # 循环分配prompt组给不同的worker
+        for worker_idx, (sample_index, sample_indices) in enumerate(prompt_groups.items()):
+            target_worker = worker_idx % num_workers
+            worker_assignments[target_worker].extend(sample_indices)
+        
+        # 为每个worker创建数据块
+        worker_chunks = []
+        for worker_idx in range(num_workers):
+            if worker_assignments[worker_idx]:
+                indices_to_select = worker_assignments[worker_idx]
+                # 创建worker的数据子集
+                chunk = prompts.select_idxs(indices_to_select)
+                worker_chunks.append(chunk)
+                print(f"[AgentLoopManager] Worker {worker_idx} 分配到 {len(indices_to_select)} 个样本")
+            else:
+                worker_chunks.append(None)  # 该worker没有分配到任务
+        
+        return worker_chunks
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}

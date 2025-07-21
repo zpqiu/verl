@@ -370,6 +370,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 if "interaction_kwargs" in new_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+                if "index" in new_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("index")
                 if "agent_name" in new_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
                 gen_batch = new_batch.pop(
@@ -378,31 +380,29 @@ class RayDAPOTrainer(RayPPOTrainer):
                 )
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
+                # index 列实际为 prompt index, 再添加 np.arange(len(gen_batch)) 作为 rollout_index 列
+                gen_batch.non_tensor_batch["rollout_index"] = np.arange(len(gen_batch))
+
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        # 获取early stopping配置
+                        # expected_prompt_num = self.config.actor_rollout_ref.rollout.get("expected_prompt_num", None)
+                        expected_prompt_num = self.config.actor_rollout_ref.rollout.n
+                        if batch:
+                            needed_valid_prompt_num -= (len(batch) // self.config.actor_rollout_ref.rollout.n)
+                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch, expected_prompt_num)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with marked_timer("gen_max", timing_raw, "red"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-
-                            new_batch = new_batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(new_batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            new_batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            new_batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
-
+                    # 处理early stopping导致的数据对齐问题
+                    if expected_prompt_num is not None:
+                        completed_rollout_index = gen_batch_output.non_tensor_batch["rollout_index"]
+                        # 过滤new_batch，只保留已完成的样本
+                        new_batch = new_batch.select_idxs(completed_rollout_index)
+                        
                     new_batch.non_tensor_batch["uid"] = np.array(
                         [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
                     )
