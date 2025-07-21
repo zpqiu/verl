@@ -50,13 +50,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class EarlyStoppingCoordinator:
     """协调早停机制的全局状态管理器"""
     
-    def __init__(self, expected_prompt_num: int, samples_per_prompt: int):
+    def __init__(self, expected_prompt_num: int):
         self.expected_prompt_num = expected_prompt_num
-        self.samples_per_prompt = samples_per_prompt
         self.completed_prompts = set()  # 已完成的prompt sample_index集合
         self.should_stop = False
         self.lock = threading.Lock()
-        print(f"[EarlyStoppingCoordinator] 初始化: expected_prompt_num={expected_prompt_num}, samples_per_prompt={samples_per_prompt}")
+        print(f"[EarlyStoppingCoordinator] 初始化: expected_prompt_num={expected_prompt_num}")
     
     def report_completion(self, sample_index: int) -> bool:
         """报告某个prompt的完成状态
@@ -783,10 +782,9 @@ class AgentLoopManager:
         # 创建早停协调器（如果需要）
         early_stopping_coordinator = None
         if expected_prompt_num is not None:
-            samples_per_prompt = self.config.actor_rollout_ref.rollout.get("samples_per_prompt", 1)
             early_stopping_coordinator = EarlyStoppingCoordinator.options(
                 name=f"early_stopping_coordinator_{uuid4().hex[:8]}"
-            ).remote(expected_prompt_num, samples_per_prompt)
+            ).remote(expected_prompt_num)
             print(f"[AgentLoopManager] 启用早停机制: expected_prompt_num={expected_prompt_num}")
 
         # 按prompt分组并分配给workers，确保同一prompt的样本在同一worker

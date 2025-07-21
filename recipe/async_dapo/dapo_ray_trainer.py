@@ -390,24 +390,25 @@ class RayDAPOTrainer(RayPPOTrainer):
                     with marked_timer("gen", timing_raw, "red"):
                         # 获取early stopping配置
                         # expected_prompt_num = self.config.actor_rollout_ref.rollout.get("expected_prompt_num", None)
-                        expected_prompt_num = self.config.actor_rollout_ref.rollout.n
+                        expected_prompt_num = self.config.data.train_batch_size
                         if batch:
-                            needed_valid_prompt_num -= (len(batch) // self.config.actor_rollout_ref.rollout.n)
+                            expected_prompt_num -= (len(batch) // self.config.actor_rollout_ref.rollout.n)
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch, expected_prompt_num)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
-                    # 处理early stopping导致的数据对齐问题
-                    if expected_prompt_num is not None:
-                        completed_rollout_index = gen_batch_output.non_tensor_batch["rollout_index"]
-                        # 过滤new_batch，只保留已完成的样本
-                        new_batch = new_batch.select_idxs(completed_rollout_index)
-                        
                     new_batch.non_tensor_batch["uid"] = np.array(
                         [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
                     )
                     # repeat to align with repeated responses in rollout
                     new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                     # 处理early stopping导致的数据对齐问题
+                    if expected_prompt_num is not None:
+                        completed_rollout_index = gen_batch_output.non_tensor_batch["rollout_index"]
+                        # 过滤new_batch，只保留已完成的样本
+                        new_batch = new_batch.select_idxs(completed_rollout_index)
+
                     new_batch = new_batch.union(gen_batch_output)
 
                     with marked_timer("reward", timing_raw, "yellow"):
