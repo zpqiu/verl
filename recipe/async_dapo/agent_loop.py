@@ -811,6 +811,9 @@ class AgentLoopManager:
                     # 尽早抛出异常，避免后续的计算
                     raise e
 
+        # 终止所有未完成的请求
+        self.abort()
+
         # 合并输出
         output = DataProto.concat(outputs)
 
@@ -902,3 +905,7 @@ class AgentLoopManager:
     def sleep(self):
         """Sleep all rollout server instances."""
         ray.get([server.sleep.remote() for server in self.async_llm_servers])
+
+    def abort(self):
+        """Abort all rollout server instances."""
+        ray.get([server.abort.remote() for server in self.async_llm_servers])

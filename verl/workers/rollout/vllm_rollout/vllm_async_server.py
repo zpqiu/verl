@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import logging
 import os
 import pickle
@@ -24,9 +25,12 @@ from starlette.responses import JSONResponse, StreamingResponse
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
+from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
+                                              ChatCompletionResponse,
+                                              ErrorResponse)
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.serving_models import (BaseModelPath,
+                                                    OpenAIServingModels)
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -336,3 +340,17 @@ class AsyncvLLMServer(AsyncServerBase):
         await self.engine.reset_prefix_cache()
         if self.config.rollout.free_cache_engine:
             await self.engine.sleep()
+
+    async def abort(self):
+        import time
+        start_time = time.time()
+        while self.engine.output_processor.has_unfinished_requests():
+            running_request_ids = [x for x in self.engine.output_processor.request_states]
+            print(f"[DEBUG] Running request ids: {running_request_ids[:10]}")
+            for request_id in running_request_ids:
+                await self.engine.abort(request_id)
+            self.engine.output_processor.abort_requests(running_request_ids)
+            print(f"Waiting for engine to finish or cancel {self.engine.output_processor.get_num_unfinished_requests()} requests...")
+            await asyncio.sleep(0.1)
+        end_time = time.time()
+        print(f"[DEBUG] Time taken to finish or cancel requests: {end_time - start_time} seconds")
