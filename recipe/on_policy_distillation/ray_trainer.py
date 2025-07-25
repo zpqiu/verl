@@ -40,25 +40,25 @@ from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (RayClassWithInitArgs, RayResourcePool,
+                                        RayWorkerGroup)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-)
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, Role, WorkerType
+from verl.trainer.ppo.metric_utils import (compute_data_metrics,
+                                           compute_throughout_metrics,
+                                           compute_timing_metrics,
+                                           process_validation_metrics)
+from verl.trainer.ppo.ray_trainer import (RayPPOTrainer, ResourcePoolManager,
+                                          Role, WorkerType)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.checkpoint_manager import (find_latest_ckpt_path,
+                                                      should_save_ckpt_esi)
 from verl.utils.debug import marked_timer
-from verl.utils.metric import (
-    reduce_metrics,
-)
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.metric import reduce_metrics
+from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
+                                         log_seqlen_unbalance)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
@@ -342,6 +342,37 @@ class RayDistillationTrainer(RayPPOTrainer):
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+    
+    def _print_sample(self, data_item):
+        prompt_ids = data_item.batch["prompts"]
+
+        prompt_length = prompt_ids.shape[-1]
+
+        valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+        valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+        response_ids = data_item.batch["responses"]
+        valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+        valid_response_ids = response_ids[:valid_response_length]
+
+        # decode
+        prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
+        response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+
+        ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+        
+        # print this sample with a beautiful format
+        print("=" * 80)
+        print("🔍 样本详情")
+        print("=" * 80)
+        print(f"📝 提示 (Prompt):\n{prompt_str}")
+        print("\n" + "-" * 40)
+        print(f"🤖 模型响应 (Response):\n{response_str}")
+        print("\n" + "-" * 40)
+        print(f"✅ 真实答案 (Ground Truth):\n{ground_truth}")
+        print("=" * 80)
+        print()
+
 
     def fit(self):
         """
@@ -450,6 +481,12 @@ class RayDistillationTrainer(RayPPOTrainer):
 
                     if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    for _ in range(3):
+                        rand_index = np.random.randint(0, len(batch))
+                        rand_item = batch[rand_index]
+                        self._print_sample(rand_item)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 
 from verl.trainer.constants_ppo import PPO_RAY_RUNTIME_ENV
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.device import is_cuda_available
 
 from .ray_trainer import RayDistillationTrainer
@@ -136,7 +137,8 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             assert config.critic.strategy in {"fsdp", "fsdp2"}
             from verl.single_controller.ray import RayWorkerGroup
-            from verl.workers.fsdp_workers import DistillationActorRolloutRefWorker
+            from verl.workers.fsdp_workers import \
+                DistillationActorRolloutRefWorker
 
             actor_rollout_cls = DistillationActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
@@ -167,6 +169,10 @@ class TaskRunner:
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
+        val_reward_fn = load_reward_manager(
+            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+        )
+
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
@@ -187,6 +193,7 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
             device_name=config.trainer.device,
+            val_reward_fn=val_reward_fn,
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()
