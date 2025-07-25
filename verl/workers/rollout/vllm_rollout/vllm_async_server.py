@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import pickle
+from contextlib import ExitStack
 from typing import Any, Callable, Optional
 
 import ray
@@ -210,6 +211,8 @@ class AsyncvLLMServer(AsyncServerBase):
         self.wg_prefix = wg_prefix
         self.engine: AsyncLLM = None
 
+        self.active_req: dict[str, asyncio.Event] = {}
+
     async def init_engine(self):
         """Init vLLM AsyncLLM engine."""
         config = self.config
@@ -286,6 +289,14 @@ class AsyncvLLMServer(AsyncServerBase):
             tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
         )
 
+        async def _force_log(stat_log_interval=10):
+            print("stat_log_interval", stat_log_interval)
+            while True:
+                await asyncio.sleep(stat_log_interval)
+                await self.engine.do_log_stats()
+
+        asyncio.create_task(_force_log(stat_log_interval=10))
+
     def _create_engine_config(self, engine_args: AsyncEngineArgs):
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
@@ -323,13 +334,47 @@ class AsyncvLLMServer(AsyncServerBase):
         prompt = TokensPrompt(prompt_token_ids=prompt_ids)
         generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
 
-        # Get final response
-        final_res: Optional[RequestOutput] = None
-        async for output in generator:
-            final_res = output
-        assert final_res is not None
+        try:
+            # Get final response
+            final_res: Optional[RequestOutput] = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
 
-        return final_res.outputs[0].token_ids
+            return final_res.outputs[0].token_ids
+        except asyncio.CancelledError:
+            # 当任务被取消时，主动取消 vLLM 引擎中的对应请求
+            print(f"[AsyncvLLMServer] Request {request_id} cancelled, aborting vLLM request")
+            try:
+                await self.engine.abort(request_id)
+                print(f"[AsyncvLLMServer] Successfully aborted request {request_id}")
+            except Exception as e:
+                print(f"[AsyncvLLMServer] Failed to abort request {request_id}: {e}")
+            
+            # 重新抛出 CancelledError，确保取消信号正确传播
+            # raise
+
+    async def generate_with_cancel(
+        self, prompt_ids: list[int], sampling_params: dict[str, Any], request_id: str
+    ) -> list[int]:
+        with ExitStack() as stack:
+            self.active_req[request_id] = asyncio.Event()
+            stack.callback(lambda: self.active_req.pop(request_id, None))
+            cancel_handle = asyncio.create_task(self.active_req[request_id].wait())
+            generation_handle = asyncio.create_task(self.generate(prompt_ids, sampling_params, request_id))
+            done, pending = await asyncio.wait([generation_handle, cancel_handle], return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            if generation_handle in done:
+                return generation_handle.result()
+            return None
+
+    async def cancel(self, request_id: str):
+        if request_id in self.active_req:
+            self.active_req[request_id].set()
+            logger.debug(f"cancel request_id {request_id}")
+        else:
+            logger.debug(f"request_id {request_id} not in active_req")
 
     async def wake_up(self):
         if self.config.rollout.free_cache_engine:
@@ -346,11 +391,11 @@ class AsyncvLLMServer(AsyncServerBase):
         start_time = time.time()
         while self.engine.output_processor.has_unfinished_requests():
             running_request_ids = [x for x in self.engine.output_processor.request_states]
-            print(f"[DEBUG] Running request ids: {running_request_ids[:10]}")
+            # print(f"[DEBUG] Running request ids: {running_request_ids[:10]}")
             for request_id in running_request_ids:
                 await self.engine.abort(request_id)
             self.engine.output_processor.abort_requests(running_request_ids)
-            print(f"Waiting for engine to finish or cancel {self.engine.output_processor.get_num_unfinished_requests()} requests...")
+            # print(f"Waiting for engine to finish or cancel {self.engine.output_processor.get_num_unfinished_requests()} requests...")
             await asyncio.sleep(0.1)
         end_time = time.time()
-        print(f"[DEBUG] Time taken to finish or cancel requests: {end_time - start_time} seconds")
+        # print(f"[DEBUG] Time taken to finish or cancel requests: {end_time - start_time} seconds")

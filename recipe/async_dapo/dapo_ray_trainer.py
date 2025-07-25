@@ -65,6 +65,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
+            test_batch.non_tensor_batch["rollout_index"] = np.arange(len(test_batch))
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
@@ -88,6 +89,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                 non_tensor_batch_keys_to_pop.append("interaction_kwargs")
             if "agent_name" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("agent_name")
+            if "index" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("index")
+            if "rollout_index" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("rollout_index")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -123,6 +128,11 @@ class RayDAPOTrainer(RayPPOTrainer):
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+
+            # 处理early stopping导致的数据对齐问题
+            completed_rollout_index = test_output_gen_batch.non_tensor_batch["rollout_index"]
+            # 过滤new_batch，只保留已完成的样本
+            test_batch = test_batch.select_idxs(completed_rollout_index)
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -370,14 +380,16 @@ class RayDAPOTrainer(RayPPOTrainer):
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 if "interaction_kwargs" in new_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-                if "index" in new_batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("index")
+                # if "index" in new_batch.non_tensor_batch:
+                #     non_tensor_batch_keys_to_pop.append("index")
                 if "agent_name" in new_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
                 gen_batch = new_batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                # 添加 index 列作为 prompt index
+                gen_batch.non_tensor_batch["index"] = np.arange(len(gen_batch))
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 # index 列实际为 prompt index, 再添加 np.arange(len(gen_batch)) 作为 rollout_index 列
@@ -453,42 +465,43 @@ class RayDAPOTrainer(RayPPOTrainer):
                         batch = new_batch
                     else:  # NOTE: When prompts after filtering is less than train batch size,
                         # we skip to the next generation batch
-                        metric_name = self.config.algorithm.filter_groups.metric
-                        if metric_name == "seq_final_reward":
-                            # Turn to numpy for easier filtering
-                            new_batch.non_tensor_batch["seq_final_reward"] = (
-                                new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
-                            )
-                        elif metric_name == "seq_reward":
-                            new_batch.non_tensor_batch["seq_reward"] = (
-                                new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
-                            )
+                        # metric_name = self.config.algorithm.filter_groups.metric
+                        # if metric_name == "seq_final_reward":
+                        #     # Turn to numpy for easier filtering
+                        #     new_batch.non_tensor_batch["seq_final_reward"] = (
+                        #         new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
+                        #     )
+                        # elif metric_name == "seq_reward":
+                        #     new_batch.non_tensor_batch["seq_reward"] = (
+                        #         new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
+                        #     )
 
-                        # Collect the sequence reward for each trajectory
-                        prompt_uid2metric_vals = defaultdict(list)
-                        for uid, metric_val in zip(
-                            new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name], strict=True
-                        ):
-                            prompt_uid2metric_vals[uid].append(metric_val)
+                        # # Collect the sequence reward for each trajectory
+                        # prompt_uid2metric_vals = defaultdict(list)
+                        # for uid, metric_val in zip(
+                        #     new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name], strict=True
+                        # ):
+                        #     prompt_uid2metric_vals[uid].append(metric_val)
 
-                        prompt_uid2metric_std = {}
-                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
-                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
+                        # prompt_uid2metric_std = {}
+                        # for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
+                        #     prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
 
-                        kept_prompt_uids = [
-                            uid
-                            for uid, std in prompt_uid2metric_std.items()
-                            if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
-                        ]
-                        num_prompt_in_batch += len(kept_prompt_uids)
+                        # kept_prompt_uids = [
+                        #     uid
+                        #     for uid, std in prompt_uid2metric_std.items()
+                        #     if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
+                        # ]
+                        # num_prompt_in_batch += len(kept_prompt_uids)
 
-                        kept_traj_idxs = []
-                        for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
-                            if traj_from_prompt_uid in kept_prompt_uids:
-                                kept_traj_idxs.append(idx)
+                        # kept_traj_idxs = []
+                        # for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
+                        #     if traj_from_prompt_uid in kept_prompt_uids:
+                        #         kept_traj_idxs.append(idx)
 
-                        new_batch = new_batch[kept_traj_idxs]
+                        # new_batch = new_batch[kept_traj_idxs]
                         batch = new_batch if batch is None else DataProto.concat([batch, new_batch])
+                        num_prompt_in_batch = len(batch) // self.config.actor_rollout_ref.rollout.n
 
                         prompt_bsz = self.config.data.train_batch_size
                         if num_prompt_in_batch < prompt_bsz:
