@@ -21,7 +21,6 @@ from collections import defaultdict
 from typing import Any
 from uuid import uuid4
 
-import datasets
 import numpy as np
 import ray
 import torch
@@ -29,7 +28,6 @@ from cachetools import LRUCache
 from omegaconf import DictConfig
 from pydantic import BaseModel
 from tensordict import TensorDict
-from transformers import AutoTokenizer
 
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
@@ -47,24 +45,24 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class EarlyStoppingCoordinator:
-    """协调早停机制的全局状态管理器"""
+    """Global state manager for coordinating early stopping mechanism"""
     
     def __init__(self, expected_prompt_num: int):
         self.expected_prompt_num = expected_prompt_num
-        self.completed_prompts = set()  # 已完成的prompt sample_index集合
-        self.invalid_prompt_count = 0  # 无效的prompt数量
+        self.completed_prompts = set()  # Set of completed prompt sample_indices
+        self.invalid_prompt_count = 0  # Count of invalid prompts
         self.should_stop = False
         self.lock = threading.Lock()
-        print(f"[EarlyStoppingCoordinator] 初始化: expected_prompt_num={expected_prompt_num}")
+        print(f"[EarlyStoppingCoordinator] Initialized: expected_prompt_num={expected_prompt_num}")
     
     def report_completion(self, sample_index: int, is_valid: bool) -> bool:
-        """报告某个prompt的完成状态
+        """Report completion status of a prompt
         
         Args:
-            sample_index: 完成的prompt的sample_index
-            is_valid: 是否有效
+            sample_index: sample_index of the completed prompt
+            is_valid: whether it's valid
         Returns:
-            bool: 是否应该触发早停
+            bool: whether early stopping should be triggered
         """
         with self.lock:
             if self.should_stop:
@@ -79,19 +77,19 @@ class EarlyStoppingCoordinator:
             
             if completed_count >= self.expected_prompt_num:
                 self.should_stop = True
-                print(f"[EarlyStoppingCoordinator] 触发早停: {completed_count}/{self.expected_prompt_num} prompts 已完成, 无效的prompt数量: {self.invalid_prompt_count}")
+                print(f"[EarlyStoppingCoordinator] Early stopping triggered: {completed_count}/{self.expected_prompt_num} prompts completed, invalid prompt count: {self.invalid_prompt_count}")
                 return True
             else:
-                print(f"[EarlyStoppingCoordinator] 进度更新: {completed_count}/{self.expected_prompt_num} prompts 已完成, 无效的prompt数量: {self.invalid_prompt_count}")
+                print(f"[EarlyStoppingCoordinator] Progress update: {completed_count}/{self.expected_prompt_num} prompts completed, invalid prompt count: {self.invalid_prompt_count}")
                 return False
     
     def should_stop_generation(self) -> bool:
-        """检查是否应该停止生成"""
+        """Check whether generation should stop"""
         with self.lock:
             return self.should_stop
     
     def get_completed_prompts(self) -> set:
-        """获取已完成的prompt集合"""
+        """Get the set of completed prompts"""
         with self.lock:
             return self.completed_prompts.copy()
 
@@ -99,8 +97,8 @@ class EarlyStoppingCoordinator:
 @ray.remote(concurrency_groups={"acquire": 1, "release": 10, "reset": 1})
 class GlobalLoadBalancer:
     """
-    全局负载均衡器，只负责分配服务器索引，不处理实际的generate调用
-    使用 threading.Semaphore 而不是 asyncio.Queue 来避免 Ray Actor 中的并发问题
+    Global load balancer that only handles server index allocation, not actual generate calls
+    Uses threading.Semaphore instead of asyncio.Queue to avoid concurrency issues in Ray Actor
     """
 
     def __init__(self, config: DictConfig, num_servers: int, max_cache_size: int = 10000):
@@ -108,18 +106,18 @@ class GlobalLoadBalancer:
 
         Args:
             config (DictConfig): YAML config.
-            num_servers (int): 服务器数量
+            num_servers (int): Number of servers
             max_cache_size (int, optional): max cache size for request_id to server mapping. Defaults to 10000.
         """
         self.config = config
         self.num_servers = num_servers
 
-        # 使用 threading.Semaphore 替代 asyncio.Queue
+        # Use threading.Semaphore instead of asyncio.Queue
         self.max_loads_per_server = 300
         self.total_capacity = self.max_loads_per_server * num_servers
         self._semaphore = threading.Semaphore(self.total_capacity)
-        self._current_loads = [0] * num_servers  # 跟踪每个服务器的当前负载
-        self._lock = threading.Lock()  # 保护 _current_loads 的并发访问
+        self._current_loads = [0] * num_servers  # Track current load of each server
+        self._lock = threading.Lock()  # Protect concurrent access to _current_loads
         
         print(f"[GlobalLoadBalancer] max_loads_per_server: {self.max_loads_per_server}")
         print(f"[GlobalLoadBalancer] total_capacity: {self.total_capacity}")
@@ -133,37 +131,32 @@ class GlobalLoadBalancer:
 
     @ray.method(concurrency_group="acquire")
     def get_server_index(self, request_id: str) -> int:
-        """获取应该使用的服务器索引"""
+        """Get the server index that should be used"""
         if self.config.actor_rollout_ref.rollout.get("load_balance", False):
-            # 获取信号量许可
+            # Acquire semaphore permission
             self._semaphore.acquire()
             
-            # 选择负载最少的服务器
+            # Select server with minimum load
             with self._lock:
                 min_load_idx = min(range(self.num_servers), key=lambda i: self._current_loads[i])
                 self._current_loads[min_load_idx] += 1
                 server_index = min_load_idx
                 
-            # if random.random() < 0.002:  # 0.2% 概率打印日志，增加可见性
-            #     print(f"[GlobalLoadBalancer] choose server: {server_index}, request_id: {request_id}, current_loads: {self._current_loads}")
             return server_index
         else:
             return self._choose_server_index(request_id)
 
     @ray.method(concurrency_group="release")
     def release_server_index(self, server_index: int):
-        """释放服务器索引"""
+        """Release server index"""
         if self.config.actor_rollout_ref.rollout.get("load_balance", False):
-            # 减少服务器负载计数
+            # Decrease server load count
             with self._lock:
                 if self._current_loads[server_index] > 0:
                     self._current_loads[server_index] -= 1
                     
-            # 释放信号量许可
+            # Release semaphore permission
             self._semaphore.release()
-            
-            # if random.random() < 0.002:  # 0.2% 概率打印日志，增加可见性
-            #     print(f"[GlobalLoadBalancer] release server: {server_index}, current_loads: {self._current_loads}")
 
     def _choose_server_index(self, request_id: str) -> int:
         if request_id in self.request_id_to_server:
@@ -177,20 +170,20 @@ class GlobalLoadBalancer:
 
     @ray.method(concurrency_group="reset")
     def reset(self):
-        """重置负载均衡器状态，包括信号量和负载计数"""
+        """Reset load balancer state, including semaphore and load counts"""
         with self._lock:
-            # 重新创建信号量
+            # Recreate semaphore
             self._semaphore = threading.Semaphore(self.total_capacity)
-            # 重置所有服务器的负载计数
+            # Reset load counts for all servers
             self._current_loads = [0] * self.num_servers
 
-        print(f"[GlobalLoadBalancer] 已重置负载均衡器状态")
+        print(f"[GlobalLoadBalancer] Load balancer state reset")
 
 
 class AsyncLLMServerManager:
     """
-    本地服务器管理器，负责实际的generate调用
-    通过全局负载均衡器获取服务器分配
+    Local server manager responsible for actual generate calls
+    Gets server allocation through global load balancer
     """
 
     def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], global_load_balancer: ray.actor.ActorHandle):
@@ -199,7 +192,7 @@ class AsyncLLMServerManager:
         Args:
             config (DictConfig): YAML config.
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
-            global_load_balancer (ray.actor.ActorHandle): 全局负载均衡器的handle
+            global_load_balancer (ray.actor.ActorHandle): Handle to global load balancer
         """
         self.config = config
         self.server_handles = server_handles
@@ -223,7 +216,7 @@ class AsyncLLMServerManager:
         Returns:
             List[int]: List of generated token ids.
         """
-        # 从全局负载均衡器获取服务器索引（现在是同步调用）
+        # Get server index from global load balancer (now synchronous call)
         server_index = await self.global_load_balancer.get_server_index.remote(request_id)
         server = self.server_handles[server_index]
         output = None
@@ -235,10 +228,10 @@ class AsyncLLMServerManager:
                 sampling_params=sampling_params,
             )
         except asyncio.CancelledError:
-            print(f"[AsyncLLMServerManager] 任务被取消: {request_id}")
+            print(f"[AsyncLLMServerManager] Task cancelled: {request_id}")
             await server.cancel.remote(request_id)
         finally:
-            # 确保释放服务器索引，即使出现异常（现在是同步调用）
+            # Ensure server index is released even if exception occurs (now synchronous call)
             await self.global_load_balancer.release_server_index.remote(server_index)
         
         return output
@@ -249,6 +242,7 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+
 
 class RewardOutput(BaseModel):
     """Reward output."""
@@ -317,13 +311,13 @@ class AgentLoopWorker:
 
         Args:
             config (DictConfig): YAML config.
-            global_load_balancer (ray.actor.ActorHandle): 全局负载均衡器的handle
+            global_load_balancer (ray.actor.ActorHandle): Handle to global load balancer
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
         """
         self.config = config
-        # 创建本地的服务器管理器，使用全局负载均衡器
+        # Create local server manager using global load balancer
         self.server_manager = AsyncLLMServerManager(config, server_handles, global_load_balancer)
-        self.early_stopping_coordinator = None  # 早停协调器，在generate_sequences时设置
+        self.early_stopping_coordinator = None  # Early stopping coordinator, set during generate_sequences
         self.max_concurrent_prompts = config.actor_rollout_ref.rollout.get("max_concurrent_prompts", 32)
 
         model_path = config.actor_rollout_ref.model.path
@@ -345,7 +339,7 @@ class AgentLoopWorker:
 
         Args:
             batch (DataProto): Input batch.
-            early_stopping_coordinator: 早停协调器
+            early_stopping_coordinator: Early stopping coordinator
 
         Returns:
             DataProto: Output batch.
@@ -392,22 +386,22 @@ class AgentLoopWorker:
 
         trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index, rollout_index)
 
-        # 按prompt分组任务，便于早停管理
+        # Group tasks by prompt for early stopping management
         prompt_groups = self._group_by_prompt(agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params)
         
-        # 动态任务创建和管理
+        # Dynamic task creation and management
         completed_outputs = {}
-        pending_tasks = {}  # task -> sample_index 的映射
+        pending_tasks = {}  # task -> sample_index mapping
         
-        # 创建待处理的prompt队列（使用列表来保持顺序）
+        # Create pending prompt queue (using list to maintain order)
         pending_prompts = list(prompt_groups.items())
         
-        # 设置最大并发任务数（可以配置）
+        # Set maximum concurrent tasks (configurable)
         max_concurrent_tasks = self.max_concurrent_prompts
-        print(f"[AgentLoopWorker] 动态任务创建模式，最大并发任务数: {max_concurrent_tasks}")
-        print(f"[AgentLoopWorker] 总共需要处理 {len(pending_prompts)} 个prompt groups")
+        print(f"[AgentLoopWorker] Dynamic task creation mode, max concurrent tasks: {max_concurrent_tasks}")
+        print(f"[AgentLoopWorker] Total {len(pending_prompts)} prompt groups to process")
         
-        # 初始创建一批任务
+        # Initially create a batch of tasks
         created_task_count = 0
         for _ in range(min(max_concurrent_tasks, len(pending_prompts))):
             if pending_prompts:
@@ -417,60 +411,60 @@ class AgentLoopWorker:
                 )
                 pending_tasks[task] = sample_index
                 created_task_count += 1
-                print(f"[AgentLoopWorker] 初始创建任务 {created_task_count}: prompt {sample_index}")
+                print(f"[AgentLoopWorker] Initially created task {created_task_count}: prompt {sample_index}")
 
-        # 主循环：等待任务完成并动态创建新任务
+        # Main loop: wait for task completion and dynamically create new tasks
         try:
             while pending_tasks:
-                # 检查早停状态
+                # Check early stopping status
                 if early_stopping_coordinator:
                     should_stop = await early_stopping_coordinator.should_stop_generation.remote()
                     if should_stop:
-                        print(f"[AgentLoopWorker] 检测到早停信号，取消剩余 {len(pending_tasks)} 个运行任务和 {len(pending_prompts)} 个待创建任务")
-                        # 取消所有待处理任务
+                        print(f"[AgentLoopWorker] Early stopping signal detected, cancelling {len(pending_tasks)} running tasks and {len(pending_prompts)} pending tasks")
+                        # Cancel all pending tasks
                         for task in pending_tasks:
                             task.cancel()
                         break
                 
-                # 等待任意一个任务完成
+                # Wait for any task to complete
                 done, still_pending = await asyncio.wait(
                     pending_tasks.keys(), 
                     return_when=asyncio.FIRST_COMPLETED,
-                    timeout=0.1  # 短暂超时以便定期检查早停状态
+                    timeout=0.1  # Short timeout to periodically check early stopping status
                 )
                 
-                # 处理已完成的任务
+                # Process completed tasks
                 for task in done:
                     completed_sample_index = pending_tasks.pop(task)
                     try:
                         sample_index, outputs = await task
                         if not outputs:
-                            print(f"[AgentLoopWorker] Prompt {sample_index} 完成，但是 invalid")
+                            print(f"[AgentLoopWorker] Prompt {sample_index} completed, but invalid")
                             if early_stopping_coordinator:
                                 await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=False)
                         else:
                             completed_outputs[sample_index] = outputs
-                            print(f"[AgentLoopWorker] Prompt {sample_index} 完成，输出 {len(outputs)} 个样本")
+                            print(f"[AgentLoopWorker] Prompt {sample_index} completed, output {len(outputs)} samples")
                             
-                            # 向协调器报告完成状态
+                            # Report completion status to coordinator
                             if early_stopping_coordinator:
                                 await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=True)
                             
                     except asyncio.CancelledError:
-                        print(f"[AgentLoopWorker] 任务 {completed_sample_index} 被取消")
+                        print(f"[AgentLoopWorker] Task {completed_sample_index} cancelled")
                     except Exception as e:
-                        print(f"[AgentLoopWorker] 任务 {completed_sample_index} 执行失败: {e}")
+                        print(f"[AgentLoopWorker] Task {completed_sample_index} failed: {e}")
                         raise e
                 
-                # 为每个完成的任务创建一个新任务（如果还有待处理的prompt）
+                # Create a new task for each completed task (if there are pending prompts)
                 new_tasks_created = 0
                 for _ in range(len(done)):
                     if pending_prompts and len(pending_tasks) < max_concurrent_tasks:
-                        # 检查早停状态，避免在早停时还创建新任务
+                        # Check early stopping status to avoid creating new tasks during early stopping
                         if early_stopping_coordinator:
                             should_stop = await early_stopping_coordinator.should_stop_generation.remote()
                             if should_stop:
-                                print(f"[AgentLoopWorker] 检测到早停信号，停止创建新任务")
+                                print(f"[AgentLoopWorker] Early stopping signal detected, stop creating new tasks")
                                 break
                         
                         sample_index, group_data = pending_prompts.pop(0)
@@ -480,26 +474,26 @@ class AgentLoopWorker:
                         pending_tasks[task] = sample_index
                         new_tasks_created += 1
                         created_task_count += 1
-                        print(f"[AgentLoopWorker] 动态创建新任务 {created_task_count}: prompt {sample_index}")
+                        print(f"[AgentLoopWorker] Dynamically created new task {created_task_count}: prompt {sample_index}")
                 
                 if new_tasks_created > 0:
-                    print(f"[AgentLoopWorker] 本轮创建了 {new_tasks_created} 个新任务，当前运行任务数: {len(pending_tasks)}")
+                    print(f"[AgentLoopWorker] Created {new_tasks_created} new tasks this round, current running tasks: {len(pending_tasks)}")
                 
-                print(f"[AgentLoopWorker] 任务状态 - 运行中: {len(pending_tasks)}, 待创建: {len(pending_prompts)}, 已完成: {len(completed_outputs)}")
+                print(f"[AgentLoopWorker] Task status - Running: {len(pending_tasks)}, Pending: {len(pending_prompts)}, Completed: {len(completed_outputs)}")
                 
         except Exception as e:
-            # 确保在异常时取消所有剩余任务
+            # Ensure all remaining tasks are cancelled on exception
             for task in pending_tasks:
                 if not task.done():
                     task.cancel()
-            # 等待取消操作完成
+            # Wait for cancellation to complete
             if pending_tasks:
                 await asyncio.gather(*pending_tasks.keys(), return_exceptions=True)
             raise e
         
-        # 只处理已完成的输出
+        # Only process completed outputs
         if not completed_outputs:
-            # 如果没有完成的输出，返回空结果
+            # If no completed outputs, return empty result
             return None
             
         all_outputs = []
@@ -510,7 +504,7 @@ class AgentLoopWorker:
         return output
 
     def _group_by_prompt(self, agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params):
-        """按prompt sample_index分组数据"""
+        """Group data by prompt sample_index"""
         prompt_groups = defaultdict(list)
         
         for i, (agent_name, messages, ground_truth, trajectory) in enumerate(zip(agent_names, raw_prompts, ground_truths, trajectory_info, strict=True)):
@@ -526,7 +520,7 @@ class AgentLoopWorker:
         return prompt_groups
 
     async def _run_prompt_group(self, sample_index: int, group_data: list, do_filter: bool = True):
-        """运行一个prompt的所有样本"""
+        """Run all samples for a prompt"""
         tasks = []
         for data in group_data:
             task = asyncio.create_task(
@@ -541,32 +535,32 @@ class AgentLoopWorker:
             tasks.append(task)
         
         try:
-            # 等待所有样本完成
+            # Wait for all samples to complete
             outputs = await asyncio.gather(*tasks)
 
             if any(output is None for output in outputs):
                 return sample_index, []
 
-            # 检查是否所有样本的 reward.reward 完全一样，如果一样，则该 prompt 为 invalid
+            # Check if all samples have identical reward.reward, if so, this prompt is invalid
             if do_filter and all(output.reward.reward == outputs[0].reward.reward for output in outputs):
                 return sample_index, []
             
             return sample_index, outputs
         except asyncio.CancelledError:
-            # print(f"[_run_prompt_group] Prompt {sample_index} 被取消，正在取消 {len(tasks)} 个子任务")
-            # 取消所有子任务
+            # print(f"[_run_prompt_group] Prompt {sample_index} cancelled, cancelling {len(tasks)} subtasks")
+            # Cancel all subtasks
             for task in tasks:
                 if not task.done():
                     task.cancel()
             
-            # 等待所有子任务的取消操作完成
+            # Wait for all subtask cancellations to complete
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
-                pass  # 忽略取消过程中的异常
+                pass  # Ignore exceptions during cancellation
             
-            # print(f"[_run_prompt_group] Prompt {sample_index} 的所有子任务已取消")
-            raise  # 重新抛出 CancelledError
+            # print(f"[_run_prompt_group] All subtasks for prompt {sample_index} cancelled")
+            raise  # Re-raise CancelledError
 
     async def _run_agent_loop(
         self,
@@ -603,11 +597,11 @@ class AgentLoopWorker:
         # print some samples
         if random.randint(0, 1024) < 1:
             print("\n" + "="*80)
-            print("🔍 [调试样例]")
+            print("🔍 [Debug Sample]")
             print("-"*80)
-            print(f"🤖 模型回答: {ori_response_str}")
-            print(f"✅ 标准答案: {ground_truth}")
-            print(f"📊 评分结果: 分数={reward:.2f} | 准确率={acc:.2f} | 预测={pred}")
+            print(f"🤖 Model Response: {ori_response_str}")
+            print(f"✅ Ground Truth: {ground_truth}")
+            print(f"📊 Evaluation Result: Score={reward:.2f} | Accuracy={acc:.2f} | Prediction={pred}")
             print("="*80 + "\n")
 
         if self.config.actor_rollout_ref.rollout.overlong_buffer.enable:
@@ -787,11 +781,11 @@ class AgentLoopManager:
         ray.get([server.init_engine.remote() for server in self.async_llm_servers])
 
     def _init_global_server_manager(self):
-        """创建全局的AsyncLLMServerManager作为Ray Actor"""
+        """Create global AsyncLLMServerManager as Ray Actor"""
         self.global_load_balancer = GlobalLoadBalancer.options(
             name="global_async_llm_load_balancer",
         ).remote(self.config, self.rollout_dp_size)
-        print("[AgentLoopManager] 创建了全局负载均衡器")
+        print("[AgentLoopManager] Created global load balancer")
 
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
@@ -801,14 +795,14 @@ class AgentLoopManager:
                     name=f"agent_loop_worker_{i}",
                 ).remote(self.config, self.global_load_balancer, self.async_llm_servers)
             )
-        print(f"[AgentLoopManager] 创建了 {len(self.agent_loop_workers)} 个AgentLoopWorker，都使用同一个全局服务器管理器")
+        print(f"[AgentLoopManager] Created {len(self.agent_loop_workers)} AgentLoopWorkers, all using the same global server manager")
 
     def generate_sequences(self, prompts: DataProto, expected_prompt_num: int = None) -> tuple[DataProto, set]:
         """Split input batch and dispatch to agent loop workers with early stopping support.
 
         Args:
             prompts (DataProto): Input batch.
-            expected_prompt_num (int, optional): 期望完成的prompt数量，达到后触发早停
+            expected_prompt_num (int, optional): Expected number of prompts to complete, triggers early stopping when reached
 
         Returns:
             tuple[DataProto, set]: (Output batch, set of completed sample indices)
@@ -817,34 +811,34 @@ class AgentLoopManager:
         print(f"[AgentLoopManager] expected_prompt_num: {expected_prompt_num}")
         print(f"[AgentLoopManager] prompts keys: {prompts.batch.keys()} non_tensor_batch: {prompts.non_tensor_batch.keys()}")
         
-        # 在每次generate调用开始时重置全局负载均衡器
+        # Reset global load balancer at the beginning of each generate call
         ray.get(self.global_load_balancer.reset.remote())
-        print(f"[AgentLoopManager] 已重置全局负载均衡器")
+        print(f"[AgentLoopManager] Reset global load balancer")
         
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
 
-        # 创建早停协调器（如果需要）
+        # Create early stopping coordinator (if needed)
         early_stopping_coordinator = None
         if expected_prompt_num is not None:
             early_stopping_coordinator = EarlyStoppingCoordinator.options(
                 name=f"early_stopping_coordinator_{uuid4().hex[:8]}"
             ).remote(expected_prompt_num)
-            print(f"[AgentLoopManager] 启用早停机制: expected_prompt_num={expected_prompt_num}")
+            print(f"[AgentLoopManager] Enabled early stopping mechanism: expected_prompt_num={expected_prompt_num}")
 
-        # 按prompt分组并分配给workers，确保同一prompt的样本在同一worker
+        # Group by prompt and assign to workers, ensuring samples from the same prompt go to the same worker
         worker_chunks = self._split_by_prompt(prompts)
         
-        # 启动所有worker任务
+        # Start all worker tasks
         worker_tasks = []
         for i, chunk in enumerate(worker_chunks):
-            if chunk is not None and len(chunk) > 0:  # 只处理非空chunk
+            if chunk is not None and len(chunk) > 0:  # Only process non-empty chunks
                 task = self.agent_loop_workers[i].generate_sequences.remote(chunk, early_stopping_coordinator)
                 worker_tasks.append(task)
             else:
                 worker_tasks.append(None)
 
-        # 等待所有worker完成
+        # Wait for all workers to complete
         outputs = []
         for i, task in enumerate(worker_tasks):
             if task is not None:
@@ -854,23 +848,23 @@ class AgentLoopManager:
                         continue
                     outputs.append(result)
                 except Exception as e:
-                    print(f"[AgentLoopManager] Worker {i} 执行失败: {e}")
-                    # 尽早抛出异常，避免后续的计算
+                    print(f"[AgentLoopManager] Worker {i} execution failed: {e}")
+                    # Throw exception early to avoid subsequent computations
                     raise e
 
-        # 终止所有未完成的请求
+        # Terminate all incomplete requests
         self.abort()
 
-        # 合并输出
+        # Merge outputs
         output = DataProto.concat(outputs)
-        print(f"[AgentLoopManager] 合并输出的 size: {len(output)}")
+        print(f"[AgentLoopManager] Merged output size: {len(output)}")
 
-        # 获取完成的prompt集合
+        # Get completed prompt set
         completed_prompts = set()
         if early_stopping_coordinator is not None:
             try:
                 completed_prompts = ray.get(early_stopping_coordinator.get_completed_prompts.remote())
-                print(f"[AgentLoopManager] 早停结束，完成了 {len(completed_prompts)} 个prompts")
+                print(f"[AgentLoopManager] Early stopping finished, completed {len(completed_prompts)} prompts")
                 ray.kill(early_stopping_coordinator)
             except Exception:
                 pass
@@ -889,57 +883,45 @@ class AgentLoopManager:
         return output
 
     def _split_by_prompt(self, prompts: DataProto) -> list:
-        """按prompt分组并分配给workers，确保同一prompt的样本分配到同一worker"""
-        # 获取sample_index信息
+        """Group by prompt and assign to workers, ensuring samples from the same prompt go to the same worker"""
+        # Get sample_index information
         if "index" in prompts.non_tensor_batch:
             indices = prompts.non_tensor_batch["index"]
         else:
             indices = np.arange(len(prompts))
         
-        # 按sample_index分组
+        # Group by sample_index
         prompt_groups = defaultdict(list)
         for i, sample_index in enumerate(indices):
             prompt_groups[sample_index].append(i)
         
-        # 调试信息：显示prompt分布
+        # Debug info: show prompt distribution
         unique_prompts = list(prompt_groups.keys())
-        samples_per_prompt = [len(samples) for samples in prompt_groups.values()]
-        print(f"[AgentLoopManager] 总共 {len(unique_prompts)} 个unique prompts")
-        print(f"[AgentLoopManager] 每个prompt的样本数范围: {min(samples_per_prompt)}-{max(samples_per_prompt)}")
-        print(f"[AgentLoopManager] 总样本数: {sum(samples_per_prompt)}")
+        print(f"[AgentLoopManager] Total {len(unique_prompts)} unique prompts")
 
-        # 分配给workers
+        # Assign to workers
         num_workers = len(self.agent_loop_workers)
         worker_assignments = [[] for _ in range(num_workers)]
-        worker_prompt_counts = [0] * num_workers  # 记录每个worker分配到的prompt数量
+        worker_prompt_counts = [0] * num_workers  # Track number of prompts assigned to each worker
         
-        # 修复：使用sample_index的值而不是枚举顺序来分配
+        # Fix: use sample_index value instead of enumeration order for assignment
         for worker_idx, (sample_index, sample_indices) in enumerate(prompt_groups.items()):
-            target_worker = worker_idx % num_workers  # 恢复原来的逻辑
+            target_worker = worker_idx % num_workers  # Restore original logic
             worker_assignments[target_worker].extend(sample_indices)
             worker_prompt_counts[target_worker] += 1
-            
-        # 调试信息：显示分配统计
-        print(f"[AgentLoopManager] 每个worker分配到的prompt数量: {worker_prompt_counts}")
-        print(f"[AgentLoopManager] prompt分配范围: {min(worker_prompt_counts)}-{max(worker_prompt_counts)}")
-        
-        # 新增：显示每个worker的样本数统计
-        worker_sample_counts = [len(assignments) for assignments in worker_assignments]
-        print(f"[AgentLoopManager] 每个worker的样本数: {worker_sample_counts}")
-        print(f"[AgentLoopManager] 样本数范围: {min(worker_sample_counts)}-{max(worker_sample_counts)}")
-        
-        # 为每个worker创建数据块
+
+        # Create data chunks for each worker
         worker_chunks = []
         for worker_idx in range(num_workers):
             if worker_assignments[worker_idx]:
                 indices_to_select = worker_assignments[worker_idx]
-                # 创建worker的数据子集
+                # Create worker's data subset
                 chunk = prompts.select_idxs(indices_to_select)
                 worker_chunks.append(chunk)
-                print(f"[AgentLoopManager] Worker {worker_idx} 分配到 {len(indices_to_select)} 个样本 ({worker_prompt_counts[worker_idx]} 个prompts)")
+                print(f"[AgentLoopManager] Worker {worker_idx} assigned {len(indices_to_select)} samples ({worker_prompt_counts[worker_idx]} prompts)")
             else:
-                worker_chunks.append(None)  # 该worker没有分配到任务
-                print(f"[AgentLoopManager] Worker {worker_idx} 没有分配到任务")
+                worker_chunks.append(None)  # This worker has no assigned tasks
+                print(f"[AgentLoopManager] Worker {worker_idx} has no assigned tasks")
         
         return worker_chunks
 
