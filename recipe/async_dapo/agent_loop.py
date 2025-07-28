@@ -31,7 +31,6 @@ from pydantic import BaseModel
 from tensordict import TensorDict
 from transformers import AutoTokenizer
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.utils import hf_tokenizer
@@ -299,13 +298,6 @@ class SingleTurnAgentLoop:
             return None
         response_mask = [1] * len(response_ids)
 
-        # response_str = self.tokenizer.decode(response_ids[: self.response_length], skip_special_tokens=True)
-        # eos_token = self.tokenizer.eos_token
-        # if response_str.endswith(eos_token):
-        #     response_str = response_str[: -len(eos_token)]
-
-        # ret = self.reward_fn(response_str)
-
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
@@ -332,6 +324,7 @@ class AgentLoopWorker:
         # 创建本地的服务器管理器，使用全局负载均衡器
         self.server_manager = AsyncLLMServerManager(config, server_handles, global_load_balancer)
         self.early_stopping_coordinator = None  # 早停协调器，在generate_sequences时设置
+        self.max_concurrent_prompts = config.actor_rollout_ref.rollout.get("max_concurrent_prompts", 32)
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -339,8 +332,6 @@ class AgentLoopWorker:
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
 
         trace_config = config.trainer.get("rollout_trace", {})
-        self.prompt_to_answer = {}
-        self._load_dataset()
 
         RolloutTraceConfig.init(
             config.trainer.project_name,
@@ -350,7 +341,7 @@ class AgentLoopWorker:
         )
 
     async def generate_sequences(self, batch: DataProto, early_stopping_coordinator: ray.actor.ActorHandle = None) -> DataProto:
-        """Generate sequences from agent loop with early stopping support.
+        """Generate sequences from agent loop with dynamic task creation and early stopping support.
 
         Args:
             batch (DataProto): Input batch.
@@ -397,62 +388,105 @@ class AgentLoopWorker:
         else:
             index = np.arange(len(raw_prompts))
         rollout_index = batch.non_tensor_batch["rollout_index"]
+        ground_truths = [item.non_tensor_batch["reward_model"]["ground_truth"] for item in batch]
 
         trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index, rollout_index)
 
         # 按prompt分组任务，便于早停管理
-        prompt_groups = self._group_by_prompt(agent_names, raw_prompts, trajectory_info, sampling_params)
+        prompt_groups = self._group_by_prompt(agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params)
         
-        # 为每个prompt创建一个任务组
-        prompt_tasks = {}
-        for sample_index, group_data in prompt_groups.items():
-            prompt_tasks[sample_index] = asyncio.create_task(
-                self._run_prompt_group(sample_index, group_data, do_filter=not is_validation)
-            )
-
-        # 等待任务完成或早停
+        # 动态任务创建和管理
         completed_outputs = {}
-        pending_tasks = set(prompt_tasks.values())
+        pending_tasks = {}  # task -> sample_index 的映射
         
+        # 创建待处理的prompt队列（使用列表来保持顺序）
+        pending_prompts = list(prompt_groups.items())
+        
+        # 设置最大并发任务数（可以配置）
+        max_concurrent_tasks = self.max_concurrent_prompts
+        print(f"[AgentLoopWorker] 动态任务创建模式，最大并发任务数: {max_concurrent_tasks}")
+        print(f"[AgentLoopWorker] 总共需要处理 {len(pending_prompts)} 个prompt groups")
+        
+        # 初始创建一批任务
+        created_task_count = 0
+        for _ in range(min(max_concurrent_tasks, len(pending_prompts))):
+            if pending_prompts:
+                sample_index, group_data = pending_prompts.pop(0)
+                task = asyncio.create_task(
+                    self._run_prompt_group(sample_index, group_data, do_filter=not is_validation)
+                )
+                pending_tasks[task] = sample_index
+                created_task_count += 1
+                print(f"[AgentLoopWorker] 初始创建任务 {created_task_count}: prompt {sample_index}")
+
+        # 主循环：等待任务完成并动态创建新任务
         try:
             while pending_tasks:
                 # 检查早停状态
                 if early_stopping_coordinator:
                     should_stop = await early_stopping_coordinator.should_stop_generation.remote()
                     if should_stop:
-                        print(f"[AgentLoopWorker] 检测到早停信号，取消剩余 {len(pending_tasks)} 个任务")
+                        print(f"[AgentLoopWorker] 检测到早停信号，取消剩余 {len(pending_tasks)} 个运行任务和 {len(pending_prompts)} 个待创建任务")
                         # 取消所有待处理任务
                         for task in pending_tasks:
                             task.cancel()
                         break
                 
                 # 等待任意一个任务完成
-                done, pending_tasks = await asyncio.wait(
-                    pending_tasks, 
+                done, still_pending = await asyncio.wait(
+                    pending_tasks.keys(), 
                     return_when=asyncio.FIRST_COMPLETED,
                     timeout=0.1  # 短暂超时以便定期检查早停状态
                 )
                 
                 # 处理已完成的任务
                 for task in done:
+                    completed_sample_index = pending_tasks.pop(task)
                     try:
                         sample_index, outputs = await task
                         if not outputs:
                             print(f"[AgentLoopWorker] Prompt {sample_index} 完成，但是 invalid")
                             if early_stopping_coordinator:
                                 await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=False)
-                            continue
-                        completed_outputs[sample_index] = outputs
-                        
-                        # 向协调器报告完成状态
-                        if early_stopping_coordinator:
-                            await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=True)
+                        else:
+                            completed_outputs[sample_index] = outputs
+                            print(f"[AgentLoopWorker] Prompt {sample_index} 完成，输出 {len(outputs)} 个样本")
+                            
+                            # 向协调器报告完成状态
+                            if early_stopping_coordinator:
+                                await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=True)
                             
                     except asyncio.CancelledError:
-                        print(f"[AgentLoopWorker] 任务被取消")
+                        print(f"[AgentLoopWorker] 任务 {completed_sample_index} 被取消")
                     except Exception as e:
-                        print(f"[AgentLoopWorker] 任务执行失败: {e}")
+                        print(f"[AgentLoopWorker] 任务 {completed_sample_index} 执行失败: {e}")
                         raise e
+                
+                # 为每个完成的任务创建一个新任务（如果还有待处理的prompt）
+                new_tasks_created = 0
+                for _ in range(len(done)):
+                    if pending_prompts and len(pending_tasks) < max_concurrent_tasks:
+                        # 检查早停状态，避免在早停时还创建新任务
+                        if early_stopping_coordinator:
+                            should_stop = await early_stopping_coordinator.should_stop_generation.remote()
+                            if should_stop:
+                                print(f"[AgentLoopWorker] 检测到早停信号，停止创建新任务")
+                                break
+                        
+                        sample_index, group_data = pending_prompts.pop(0)
+                        task = asyncio.create_task(
+                            self._run_prompt_group(sample_index, group_data, do_filter=not is_validation)
+                        )
+                        pending_tasks[task] = sample_index
+                        new_tasks_created += 1
+                        created_task_count += 1
+                        print(f"[AgentLoopWorker] 动态创建新任务 {created_task_count}: prompt {sample_index}")
+                
+                if new_tasks_created > 0:
+                    print(f"[AgentLoopWorker] 本轮创建了 {new_tasks_created} 个新任务，当前运行任务数: {len(pending_tasks)}")
+                
+                print(f"[AgentLoopWorker] 任务状态 - 运行中: {len(pending_tasks)}, 待创建: {len(pending_prompts)}, 已完成: {len(completed_outputs)}")
+                
         except Exception as e:
             # 确保在异常时取消所有剩余任务
             for task in pending_tasks:
@@ -460,7 +494,7 @@ class AgentLoopWorker:
                     task.cancel()
             # 等待取消操作完成
             if pending_tasks:
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
+                await asyncio.gather(*pending_tasks.keys(), return_exceptions=True)
             raise e
         
         # 只处理已完成的输出
@@ -475,15 +509,16 @@ class AgentLoopWorker:
         output = self._postprocess(all_outputs)
         return output
 
-    def _group_by_prompt(self, agent_names, raw_prompts, trajectory_info, sampling_params):
+    def _group_by_prompt(self, agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params):
         """按prompt sample_index分组数据"""
         prompt_groups = defaultdict(list)
         
-        for i, (agent_name, messages, trajectory) in enumerate(zip(agent_names, raw_prompts, trajectory_info, strict=True)):
+        for i, (agent_name, messages, ground_truth, trajectory) in enumerate(zip(agent_names, raw_prompts, ground_truths, trajectory_info, strict=True)):
             sample_index = trajectory["sample_index"]
             prompt_groups[sample_index].append({
                 "agent_name": agent_name,
                 "messages": messages.tolist(),
+                "ground_truth": ground_truth,
                 "trajectory": trajectory,
                 "sampling_params": sampling_params
             })
@@ -498,6 +533,7 @@ class AgentLoopWorker:
                 self._run_agent_loop(
                     data["agent_name"], 
                     data["messages"], 
+                    data["ground_truth"],
                     data["sampling_params"], 
                     data["trajectory"]
                 )
@@ -532,35 +568,11 @@ class AgentLoopWorker:
             # print(f"[_run_prompt_group] Prompt {sample_index} 的所有子任务已取消")
             raise  # 重新抛出 CancelledError
 
-    def _create_empty_output(self):
-        """创建空的输出结果"""
-        prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
-        response_length = self.config.actor_rollout_ref.rollout.response_length
-        
-        # 创建空的tensor
-        empty_batch = TensorDict(
-            {
-                "prompts": torch.empty((0, prompt_length), dtype=torch.long),
-                "responses": torch.empty((0, response_length), dtype=torch.long),
-                "response_mask": torch.empty((0, response_length), dtype=torch.long),
-                "input_ids": torch.empty((0, prompt_length + response_length), dtype=torch.long),
-                "attention_mask": torch.empty((0, prompt_length + response_length), dtype=torch.long),
-                "position_ids": torch.empty((0, prompt_length + response_length), dtype=torch.long),
-                "token_level_scores": torch.empty((0, response_length), dtype=torch.float32),
-            },
-            batch_size=0,
-        )
-        
-        return DataProto(
-            batch=empty_batch, 
-            non_tensor_batch={"__num_turns__": np.array([], dtype=np.int32)}, 
-            meta_info={"metrics": []}
-        )
-
     async def _run_agent_loop(
         self,
         agent_name: str,
         messages: list[dict[str, Any]],
+        ground_truth: str,
         sampling_params: dict[str, Any],
         trajectory: dict[str, Any],
     ) -> AgentLoopOutput:
@@ -571,47 +583,11 @@ class AgentLoopWorker:
             output = await agent_loop.run(messages, sampling_params)
             if output is None:
                 return None
-            output.reward = self._compute_reward(messages[0]["content"], output)
+            output.reward = self._compute_reward(ground_truth, output)
             output.rollout_index = trajectory["rollout_index"]
             return output
-        
-    def _load_dataset(self):
-        """加载数据集并构建prompt到answer的映射"""
-        try:
-            print("正在加载 DAPO-Math-17k 数据集...")
-            ds = datasets.load_dataset("parquet", data_files=self.config.data.train_files, split='train')
-            
-            prompt2answer = {}
-            for example in ds:
-                prompt = example['prompt'][0]['content']
-                ground_truth = example["reward_model"]['ground_truth']
-                prompt2answer[prompt] = ground_truth
 
-            # 加载 AIME 2024 数据集
-            print("正在加载 AIME 2024 数据集...")
-            print(self.config.data.val_files)
-            aime_ds = datasets.load_dataset("parquet", data_files=[self.config.data.val_files[0]], split='train')
-            for example in aime_ds:
-                prompt = example['prompt'][0]['content']
-                ground_truth = example["reward_model"]['ground_truth']
-                prompt2answer[prompt] = ground_truth
-            
-            self.prompt_to_answer = prompt2answer
-            print(f"成功加载 {len(self.prompt_to_answer)} 个问答对")
-            
-            # 打印前5个QA对进行验证
-            for i, (prompt, answer) in enumerate(list(self.prompt_to_answer.items())[:5]):
-                print(f"样例 {i}: {prompt[:50]}... -> {answer}")
-                
-        except Exception as e:
-            print(f"加载数据集失败: {e}")
-            self.prompt_to_answer = {}
-
-    def _compute_reward(self, question: str, output: AgentLoopOutput) -> RewardOutput:
-        if question not in self.prompt_to_answer:
-            print(f"[AgentLoop] question not in dataset: {question}")
-        
-        ground_truth = self.prompt_to_answer.get(question, question)
+    def _compute_reward(self, ground_truth: str, output: AgentLoopOutput) -> RewardOutput:
         response_str = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
         
         ori_response_str = response_str
@@ -629,7 +605,6 @@ class AgentLoopWorker:
             print("\n" + "="*80)
             print("🔍 [调试样例]")
             print("-"*80)
-            print(f"📝 问题: {question}")
             print(f"🤖 模型回答: {ori_response_str}")
             print(f"✅ 标准答案: {ground_truth}")
             print(f"📊 评分结果: 分数={reward:.2f} | 准确率={acc:.2f} | 预测={pred}")

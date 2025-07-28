@@ -18,7 +18,6 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import uuid
 from collections import defaultdict
-from copy import deepcopy
 from pprint import pprint
 
 import numpy as np
@@ -36,9 +35,8 @@ from verl.trainer.ppo.metric_utils import (compute_data_metrics,
                                            compute_timing_metrics,
                                            process_validation_metrics,
                                            reduce_metrics)
-from verl.trainer.ppo.ray_trainer import (AdvantageEstimator, RayPPOTrainer,
-                                          Role, apply_kl_penalty,
-                                          compute_advantage,
+from verl.trainer.ppo.ray_trainer import (RayPPOTrainer, Role,
+                                          apply_kl_penalty, compute_advantage,
                                           compute_response_mask)
 from verl.utils.profiler import marked_timer
 
@@ -93,6 +91,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                 non_tensor_batch_keys_to_pop.append("index")
             if "rollout_index" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("rollout_index")
+            if "reward_model" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("reward_model")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -138,17 +138,12 @@ class RayDAPOTrainer(RayPPOTrainer):
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
-            # result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = test_batch.batch["token_level_scores"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
-            # if "reward_extra_info" in result:
-            #     for key, lst in result["reward_extra_info"].items():
-            #         reward_extra_infos_dict[key].extend(lst)
-            #         print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
             if "acc" in test_output_gen_batch.non_tensor_batch:
                 reward_extra_infos_dict["acc"].extend(test_output_gen_batch.non_tensor_batch["acc"])
 
@@ -380,8 +375,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 if "interaction_kwargs" in new_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-                # if "index" in new_batch.non_tensor_batch:
-                #     non_tensor_batch_keys_to_pop.append("index")
+                if "reward_model" in new_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("reward_model")
                 if "agent_name" in new_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
                 gen_batch = new_batch.pop(
@@ -424,32 +419,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                     new_batch = new_batch.union(gen_batch_output)
 
                     with marked_timer("reward", timing_raw, "yellow"):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        # if self.use_rm:
-                        #     # we first compute reward model score
-                        #     reward_tensor = self.rm_wg.compute_rm_score(new_batch)
-                        #     new_batch = new_batch.union(reward_tensor)
-
-                        # # we combine with rule-based rm
-                        # reward_extra_infos_dict: dict[str, list]
-                        # try:
-                        #     reward_result = self.reward_fn(new_batch, return_dict=True)
-                        #     reward_tensor = reward_result["reward_tensor"]
-                        #     reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
-                        # except Exception as e:
-                        #     print(f"Error in reward_fn: {e}")
-                        #     reward_tensor = self.reward_fn(new_batch)
-                        #     reward_extra_infos_dict = {}
-
-                        # new_batch.batch["token_level_scores"] = reward_tensor
-
-                        # if reward_extra_infos_dict:
-                        #     new_batch.non_tensor_batch.update(
-                        #         {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
-                        #     )
-
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             new_batch, kl_metrics = apply_kl_penalty(
@@ -464,41 +433,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
                     else:  # NOTE: When prompts after filtering is less than train batch size,
-                        # we skip to the next generation batch
-                        # metric_name = self.config.algorithm.filter_groups.metric
-                        # if metric_name == "seq_final_reward":
-                        #     # Turn to numpy for easier filtering
-                        #     new_batch.non_tensor_batch["seq_final_reward"] = (
-                        #         new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
-                        #     )
-                        # elif metric_name == "seq_reward":
-                        #     new_batch.non_tensor_batch["seq_reward"] = (
-                        #         new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
-                        #     )
-
-                        # # Collect the sequence reward for each trajectory
-                        # prompt_uid2metric_vals = defaultdict(list)
-                        # for uid, metric_val in zip(
-                        #     new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name], strict=True
-                        # ):
-                        #     prompt_uid2metric_vals[uid].append(metric_val)
-
-                        # prompt_uid2metric_std = {}
-                        # for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
-                        #     prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
-
-                        # kept_prompt_uids = [
-                        #     uid
-                        #     for uid, std in prompt_uid2metric_std.items()
-                        #     if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
-                        # ]
-                        # num_prompt_in_batch += len(kept_prompt_uids)
-
-                        # kept_traj_idxs = []
-                        # for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
-                        #     if traj_from_prompt_uid in kept_prompt_uids:
-                        #         kept_traj_idxs.append(idx)
-
                         # new_batch = new_batch[kept_traj_idxs]
                         batch = new_batch if batch is None else DataProto.concat([batch, new_batch])
                         num_prompt_in_batch = len(batch) // self.config.actor_rollout_ref.rollout.n

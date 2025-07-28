@@ -17,6 +17,10 @@ reward_model:
     penalty_factor: 0.0
     log: False
 
+actor_rollout_ref:
+  rollout:
+    max_concurrent_prompts: 32 # Each AgentLoopWorker will submit at most max_concurrent_prompts prompts to generate at the same time
+
 algorithm:
   filter_groups:
     _target_: verl.trainer.config.FilterGroupsConfig
