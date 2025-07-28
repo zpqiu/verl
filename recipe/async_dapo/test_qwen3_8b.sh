@@ -65,9 +65,7 @@ infer_micro_batch_size=null
 train_micro_batch_size=null
 offload=False
 
-ray job submit --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.async_dapo.main_dapo \
+python3 -m recipe.async_dapo.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="[$home_dir/data/aime-2024.parquet]" \
     data.prompt_key=prompt \
