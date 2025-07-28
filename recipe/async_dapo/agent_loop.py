@@ -112,8 +112,8 @@ class GlobalLoadBalancer:
         self.config = config
         self.num_servers = num_servers
 
-        # Use threading.Semaphore instead of asyncio.Queue
-        self.max_loads_per_server = 300
+        # TODO: add a config for this
+        self.max_loads_per_server = 256
         self.total_capacity = self.max_loads_per_server * num_servers
         self._semaphore = threading.Semaphore(self.total_capacity)
         self._current_loads = [0] * num_servers  # Track current load of each server
