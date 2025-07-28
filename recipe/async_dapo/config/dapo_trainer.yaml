@@ -20,6 +20,10 @@ reward_model:
 actor_rollout_ref:
   rollout:
     max_concurrent_prompts: 32 # Each AgentLoopWorker will submit at most max_concurrent_prompts prompts to generate at the same time
+    agent:
+      custom_async_server:
+        path: pkg://recipe.async_dapo.vllm_async_server
+        name: AsyncvLLMServer
 
 algorithm:
   filter_groups:
