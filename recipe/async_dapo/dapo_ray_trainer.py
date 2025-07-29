@@ -383,11 +383,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
-                # 添加 index 列作为 prompt index
+                # add index column as prompt index
                 gen_batch.non_tensor_batch["index"] = np.arange(len(gen_batch))
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                # index 列实际为 prompt index, 再添加 np.arange(len(gen_batch)) 作为 rollout_index 列
+                # index column is actually the prompt index, add np.arange(len(gen_batch)) as rollout_index column
                 gen_batch.non_tensor_batch["rollout_index"] = np.arange(len(gen_batch))
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -395,8 +395,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        # 获取early stopping配置
-                        # expected_prompt_num = self.config.actor_rollout_ref.rollout.get("expected_prompt_num", None)
+                        # get early stopping configuration
                         expected_prompt_num = self.config.data.train_batch_size
                         if batch:
                             expected_prompt_num -= (len(batch) // self.config.actor_rollout_ref.rollout.n)
@@ -410,10 +409,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # repeat to align with repeated responses in rollout
                     new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                     # 处理early stopping导致的数据对齐问题
+                     # handle the mismatch between new_batch and gen_batch_output
                     if expected_prompt_num is not None:
                         completed_rollout_index = gen_batch_output.non_tensor_batch["rollout_index"]
-                        # 过滤new_batch，只保留已完成的样本
+                        # filter out the prompts that are not completed
                         new_batch = new_batch.select_idxs(completed_rollout_index)
 
                     new_batch = new_batch.union(gen_batch_output)
