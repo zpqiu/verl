@@ -50,17 +50,19 @@ class EarlyStoppingCoordinator:
     def __init__(self, expected_prompt_num: int):
         self.expected_prompt_num = expected_prompt_num
         self.completed_prompts = set()  # Set of completed prompt sample_indices
+        self.easy_prompts = set()  # Set of easy prompts
         self.invalid_prompt_count = 0  # Count of invalid prompts
         self.should_stop = False
         self.lock = threading.Lock()
         print(f"[EarlyStoppingCoordinator] Initialized: expected_prompt_num={expected_prompt_num}")
     
-    def report_completion(self, sample_index: int, is_valid: bool) -> bool:
+    def report_completion(self, sample_index: int, is_valid: bool, is_too_easy: bool) -> bool:
         """Report completion status of a prompt
         
         Args:
             sample_index: sample_index of the completed prompt
             is_valid: whether it's valid
+            is_too_easy: whether the prompt is too easy
         Returns:
             bool: whether early stopping should be triggered
         """
@@ -72,6 +74,9 @@ class EarlyStoppingCoordinator:
                 self.completed_prompts.add(sample_index)
             else:
                 self.invalid_prompt_count += 1
+
+            if is_too_easy:
+                self.easy_prompts.add(sample_index)
             
             completed_count = len(self.completed_prompts)
             
@@ -92,6 +97,11 @@ class EarlyStoppingCoordinator:
         """Get the set of completed prompts"""
         with self.lock:
             return self.completed_prompts.copy()
+    
+    def get_easy_prompts(self) -> set:
+        """Get the set of easy prompts"""
+        with self.lock:
+            return self.easy_prompts.copy()
 
 
 @ray.remote(concurrency_groups={"acquire": 1, "release": 10, "reset": 1})
@@ -437,18 +447,18 @@ class AgentLoopWorker:
                 for task in done:
                     completed_sample_index = pending_tasks.pop(task)
                     try:
-                        sample_index, outputs = await task
+                        sample_index, outputs, mean_reward = await task
                         if not outputs:
-                            print(f"[AgentLoopWorker] Prompt {sample_index} completed, but invalid")
+                            print(f"[AgentLoopWorker] Prompt {sample_index} completed, but invalid, mean_reward: {mean_reward}")
                             if early_stopping_coordinator:
-                                await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=False)
+                                await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=False, is_too_easy=(mean_reward == 1.0))
                         else:
                             completed_outputs[sample_index] = outputs
                             print(f"[AgentLoopWorker] Prompt {sample_index} completed, output {len(outputs)} samples")
                             
                             # Report completion status to coordinator
                             if early_stopping_coordinator:
-                                await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=True)
+                                await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=True, is_too_easy=False)
                             
                     except asyncio.CancelledError:
                         print(f"[AgentLoopWorker] Task {completed_sample_index} cancelled")
@@ -539,13 +549,13 @@ class AgentLoopWorker:
             outputs = await asyncio.gather(*tasks)
 
             if any(output is None for output in outputs):
-                return sample_index, []
+                return sample_index, [], None
 
             # Check if all samples have identical reward.reward, if so, this prompt is invalid
             if do_filter and all(output.reward.reward == outputs[0].reward.reward for output in outputs):
-                return sample_index, []
+                return sample_index, [], outputs[0].reward.reward
             
-            return sample_index, outputs
+            return sample_index, outputs, outputs[0].reward.reward
         except asyncio.CancelledError:
             # print(f"[_run_prompt_group] Prompt {sample_index} cancelled, cancelling {len(tasks)} subtasks")
             # Cancel all subtasks
@@ -729,6 +739,8 @@ class AgentLoopManager:
         self._init_global_server_manager()
         self._init_agent_loop_workers()
 
+        self.easy_prompts = set()  # Set of easy prompts
+
         # Initially we're in sleep mode.
         self.sleep()
 
@@ -810,7 +822,9 @@ class AgentLoopManager:
         # print prompts keys for debug
         print(f"[AgentLoopManager] expected_prompt_num: {expected_prompt_num}")
         print(f"[AgentLoopManager] prompts keys: {prompts.batch.keys()} non_tensor_batch: {prompts.non_tensor_batch.keys()}")
-        
+
+        is_validation = prompts.meta_info.get("validate", False)
+
         # Reset global load balancer at the beginning of each generate call
         ray.get(self.global_load_balancer.reset.remote())
         print(f"[AgentLoopManager] Reset global load balancer")
@@ -827,7 +841,7 @@ class AgentLoopManager:
             print(f"[AgentLoopManager] Enabled early stopping mechanism: expected_prompt_num={expected_prompt_num}")
 
         # Group by prompt and assign to workers, ensuring samples from the same prompt go to the same worker
-        worker_chunks = self._split_by_prompt(prompts)
+        worker_chunks = self._split_by_prompt(prompts, do_filter=not is_validation and self.config.actor_rollout_ref.rollout.get("offline_filter", False))
         
         # Start all worker tasks
         worker_tasks = []
@@ -865,6 +879,10 @@ class AgentLoopManager:
             try:
                 completed_prompts = ray.get(early_stopping_coordinator.get_completed_prompts.remote())
                 print(f"[AgentLoopManager] Early stopping finished, completed {len(completed_prompts)} prompts")
+                easy_prompts = ray.get(early_stopping_coordinator.get_easy_prompts.remote())
+                print(f"[AgentLoopManager] Easy prompts: {len(easy_prompts)}")
+                self.easy_prompts.update(easy_prompts)
+                print(f"[AgentLoopManager] Easy prompts: {len(self.easy_prompts)}")
                 ray.kill(early_stopping_coordinator)
             except Exception:
                 pass
@@ -882,7 +900,7 @@ class AgentLoopManager:
         output.meta_info = {"timing": timing}
         return output
 
-    def _split_by_prompt(self, prompts: DataProto) -> list:
+    def _split_by_prompt(self, prompts: DataProto, do_filter: bool = True) -> list:
         """Group by prompt and assign to workers, ensuring samples from the same prompt go to the same worker"""
         # Get sample_index information
         if "index" in prompts.non_tensor_batch:
@@ -898,6 +916,18 @@ class AgentLoopManager:
         # Debug info: show prompt distribution
         unique_prompts = list(prompt_groups.keys())
         print(f"[AgentLoopManager] Total {len(unique_prompts)} unique prompts")
+
+        if do_filter:
+            # filter out easy prompts
+            prompts_to_remove = []
+            for prompt_index in prompt_groups:
+                if prompt_index in self.easy_prompts and random.random() < 0.8:
+                    prompts_to_remove.append(prompt_index)
+            
+            for prompt_index in prompts_to_remove:
+                prompt_groups.pop(prompt_index)
+            
+            print(f"[AgentLoopManager] Filtered out {len(prompts_to_remove)} easy prompts, {len(prompt_groups)} prompts remaining")
 
         # Assign to workers
         num_workers = len(self.agent_loop_workers)

@@ -15,7 +15,7 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
-
+import os
 import uuid
 from collections import defaultdict
 from pprint import pprint
@@ -37,7 +37,8 @@ from verl.trainer.ppo.metric_utils import (compute_data_metrics,
                                            reduce_metrics)
 from verl.trainer.ppo.ray_trainer import (RayPPOTrainer, Role,
                                           apply_kl_penalty, compute_advantage,
-                                          compute_response_mask)
+                                          compute_response_mask,
+                                          find_latest_ckpt_path)
 from verl.utils.profiler import marked_timer
 
 
@@ -379,12 +380,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                     non_tensor_batch_keys_to_pop.append("reward_model")
                 if "agent_name" in new_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
+                if "index" in new_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("index")
                 gen_batch = new_batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
                 # 添加 index 列作为 prompt index
-                gen_batch.non_tensor_batch["index"] = np.arange(len(gen_batch))
+                # gen_batch.non_tensor_batch["index"] = np.arange(len(gen_batch))
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 # index 列实际为 prompt index, 再添加 np.arange(len(gen_batch)) 作为 rollout_index 列
@@ -573,3 +576,59 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+
+        # path: given_path + `/global_step_{global_steps}` + `/actor`
+        local_global_step_folder = os.path.join(
+            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+        )
+
+        # save easy prompts
+        easy_prompts_local_path = os.path.join(local_global_step_folder, "easy_prompts.pt")
+        if hasattr(self, "async_rollout_manager") and hasattr(self.async_rollout_manager, "easy_prompts"):
+            torch.save(self.async_rollout_manager.easy_prompts, easy_prompts_local_path)
+        else:
+            print("Warning: no easy prompts to save")
+
+    def _load_checkpoint(self):
+        if self.config.trainer.resume_mode == "disable":
+            return 0
+        
+        super()._load_checkpoint()
+
+        # load from hdfs
+        if self.config.trainer.default_hdfs_dir is not None:
+            raise NotImplementedError("load from hdfs is not implemented yet")
+        else:
+            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
+            if not os.path.isabs(checkpoint_folder):
+                working_dir = os.getcwd()
+                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+
+        # find global_step_folder
+        if self.config.trainer.resume_mode == "auto":
+            if global_step_folder is None:
+                print("Training from scratch")
+                return 0
+        else:
+            if self.config.trainer.resume_mode == "resume_path":
+                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+                assert "global_step_" in self.config.trainer.resume_from_path, (
+                    "resume ckpt must specify the global_steps"
+                )
+                global_step_folder = self.config.trainer.resume_from_path
+                if not os.path.isabs(global_step_folder):
+                    working_dir = os.getcwd()
+                    global_step_folder = os.path.join(working_dir, global_step_folder)
+        print(f"Load from checkpoint folder: {global_step_folder}")
+        # set global step
+        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+
+        if os.path.exists(os.path.join(global_step_folder, "easy_prompts.pt")) and hasattr(self, "async_rollout_manager"):
+            self.async_rollout_manager.easy_prompts = torch.load(os.path.join(global_step_folder, "easy_prompts.pt"))
+            print(f"Loaded {len(self.async_rollout_manager.easy_prompts)} easy prompts")
+        else:
+            print("Warning: no easy prompts to load")
