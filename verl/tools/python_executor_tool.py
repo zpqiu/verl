@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import random
 
 from verl.tools.mcp_base_tool import MCPBaseTool
 
@@ -117,5 +118,12 @@ class PythonExecutorTool(MCPBaseTool):
             metadata["api_request_error"] = error_msg
             metadata["status"] = "error"
             result_text = f"❌ {error_msg}"
+
+        if random.randint(0, 100) < 1:
+            print("================")
+            print(metadata)
+            print("================")
+            print(result_text)
+            print("================")
         
         return result_text, metadata
