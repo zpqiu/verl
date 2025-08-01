@@ -1,0 +1,12 @@
+tools:
+  - class_name: verl.tools.python_executor_tool.PythonExecutorTool
+    config:
+      rate_limit: 60  # 每分钟最多60次请求
+      timeout: 60     # 60秒超时
+      type: mcp
+    mcp:
+      mcp_servers_config_path: ./examples/python_executor/config/mcp_server.json
+      # 可选：指定要使用的工具列表
+      tool_selected_list:
+        - execute_python_code
+        - get_available_modules
