@@ -217,10 +217,16 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Python Code Executor MCP Server")
-    parser.add_argument("--port", type=int, default=8000, help="Server port")
+    parser.add_argument("--port", type=int, help="Server port (if not specified, use STDIO)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Server host")
     args = parser.parse_args()
     
-    # 启动服务器
-    print(f"Starting Python Code Executor MCP Server on {args.host}:{args.port}")
-    mcp.run(host=args.host, port=args.port)
+    # 根据参数决定启动模式
+    if args.port:
+        # HTTP 模式
+        print(f"Starting Python Code Executor MCP Server on {args.host}:{args.port}")
+        mcp.run(host=args.host, port=args.port)
+    else:
+        # STDIO 模式（适合进程间通信）
+        print("Starting Python Code Executor MCP Server in STDIO mode", file=sys.stderr)
+        mcp.run()
