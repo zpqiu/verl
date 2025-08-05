@@ -125,20 +125,75 @@ print(f"平均值: {np.mean(arr)}")
 - 危险函数 (`exec`, `eval`)
 - 用户输入 (`input`, `raw_input`)
 
+## 集群环境部署
+
+### ⚠️ 分布式训练注意事项
+
+在分布式/集群环境中，多个 worker 进程同时启动可能导致端口冲突。请参考以下解决方案：
+
+#### 推荐：STDIO 传输模式
+
+修改 `mcp_server.json` 使用 STDIO 传输：
+
+```json
+{
+    "mcpServers": {
+        "Python Executor": {
+            "command": "python", 
+            "args": ["-m", "verl.tools.mcp_services.python_executor_server"],
+            "env": {
+                "PYTHONPATH": "."
+            }
+        }
+    }
+}
+```
+
+#### 备选：动态端口分配
+
+如果需要网络访问，使用动态端口：
+
+```json
+{
+    "mcpServers": {
+        "Python Executor": {
+            "command": "python", 
+            "args": ["-m", "verl.tools.mcp_services.python_executor_server_with_port_finder", "--strategy", "pid"],
+            "env": {
+                "PYTHONPATH": "."
+            }
+        }
+    }
+}
+```
+
+### 集群部署测试
+
+验证多进程启动：
+
+```bash
+python examples/python_executor/test_cluster_deployment.py
+```
+
+详细部署指南请参考：[CLUSTER_DEPLOYMENT.md](./CLUSTER_DEPLOYMENT.md)
+
 ## 故障排除
 
 ### 常见问题
 
-1. **MCP 服务启动失败**
-   - 检查端口是否被占用
-   - 确保 Python 路径正确
-   - 检查 fastmcp 是否正确安装
+1. **"Client failed to connect: Connection closed"**
+   - ✅ 使用 STDIO 传输模式（推荐）
+   - ✅ 检查 fastmcp 版本：`pip install --upgrade fastmcp`
 
-2. **代码执行被拒绝**
+2. **"Address already in use"**
+   - ✅ 使用动态端口分配
+   - ✅ 改用 STDIO 传输模式
+
+3. **代码执行被拒绝**
    - 检查代码是否包含被禁止的函数或模块
    - 确保代码语法正确
 
-3. **连接超时**
+4. **连接超时**
    - 检查网络连接
    - 增加超时时间设置
 
@@ -148,6 +203,16 @@ print(f"平均值: {np.mean(arr)}")
 
 ```bash
 export VERL_LOGGING_LEVEL=DEBUG
+```
+
+### 多进程环境验证
+
+```bash
+# 验证不会重复启动服务
+python examples/python_executor/verify_no_duplicate_startup.py
+
+# 测试集群部署
+python examples/python_executor/test_cluster_deployment.py
 ```
 
 ## 扩展开发

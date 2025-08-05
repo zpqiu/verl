@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+import random
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -37,7 +38,7 @@ class MCPBaseTool(BaseTool):
         self.timeout = config.get("timeout", 30)
 
         # TODO(hechanghao): create a global client manager to manage the rate limit, client and pool
-        logger.info(f"Initialized MCPBaseTool with config: {config}")
+        print(f"Initialized MCPBaseTool with config: {config}")
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         """Return the OpenAI tool schema."""
@@ -71,20 +72,22 @@ class MCPBaseTool(BaseTool):
         except Exception as e:
             err_msg = f"\n An unexpected error occurred: {e}"
 
-        logger.debug(f"Tool result for instance {instance_id} with tool {self.name}: {call_tool_result.content}")
         result, metadata = self._parse_tool_result(call_tool_result.content)
         metadata["api_request_error"] = None if not err_msg else err_msg
         return result, metadata
 
     @rollout_trace_op
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[str, float, dict]:
+        print(f"[DEBUG][MCPBaseTool] execute: {instance_id}, {parameters}")
         if self.name == "" or self.name is None or parameters is None:
             error_msg = "Error: 'parameters' is missing or empty."
-            logger.error(f"[MCPTool] {error_msg} Received tool name: {self.name}, parameters: {parameters}")
+            print(f"[MCPTool] {error_msg} Received tool name: {self.name}, parameters: {parameters}")
             return json.dumps({"result": error_msg}), 0.0, {}
 
         try:
             result_text, metadata = await self._call_tool(instance_id, parameters)
+            if random.random() < 0.1:
+                print(f"[DEBUG][MCPBaseTool] result_text: {result_text}, metadata: {metadata}")
 
             # Store results in instance dictionary
             self._instance_dict[instance_id]["reward"].append(result_text.strip())
@@ -101,7 +104,7 @@ class MCPBaseTool(BaseTool):
 
         except Exception as e:
             error_result = json.dumps({"result": f"Tool execution failed: {e}"})
-            logger.error(f"[MCPBaseTool] Execution failed: {e}")
+            print(f"[MCPBaseTool] Execution failed: {e}")
             return error_result, 0.0, {"error": str(e)}
 
     async def calc_reward(self, instance_id: str, **kwargs) -> str:

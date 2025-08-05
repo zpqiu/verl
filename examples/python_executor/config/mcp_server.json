@@ -1,11 +1,7 @@
 {
     "mcpServers": {
         "Python Executor": {
-            "command": "python", 
-            "args": ["-m", "verl.tools.mcp_services.python_executor_server"],
-            "env": {
-                "PYTHONPATH": "."
-            }
+            "url": "http://127.0.0.1:3001/mcp"
         }
     }
 }

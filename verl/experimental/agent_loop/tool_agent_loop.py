@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from typing import Any
 from uuid import uuid4
 
@@ -66,6 +67,9 @@ class ToolAgentLoop(AgentLoopBase):
                 messages, tools=self.tool_schemas, add_generation_prompt=True, tokenize=True
             ),
         )
+        # if random.random() < 0.1:
+            # text = await self.loop.run_in_executor(None, self.tokenizer.decode, prompt_ids)
+            # print(f"prompt: {text}")
         response_mask = []
         tools_kwargs = kwargs.get("tools_kwargs", {})
 
@@ -95,6 +99,8 @@ class ToolAgentLoop(AgentLoopBase):
             _, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
             if not tool_calls:
                 break
+
+            # print(f"[DEBUF] tool_calls: {tool_calls}")
 
             # call tools
             tasks = []
@@ -145,9 +151,10 @@ class ToolAgentLoop(AgentLoopBase):
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
             instance_id = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
+            # print(f"[DEBUF] tool_args: {tool_args}, instance_id: {instance_id}, tool_name: {tool_name}")
             tool_response, _, _ = await tool.execute(instance_id, tool_args)
         except Exception as e:
-            logger.exception(f"Error when executing tool: {e}")
+            print(f"Error when executing tool: {e}")
             return e
         finally:
             if tool and instance_id:
@@ -161,6 +168,8 @@ class ToolAgentLoop(AgentLoopBase):
             else:
                 length = self.max_tool_response_length // 2
                 tool_response = tool_response[:length] + "...(truncated)..." + tool_response[-length:]
+
+        # print(f"[DEBUF] tool_response: {tool_response}")
 
         return {
             "role": "tool",

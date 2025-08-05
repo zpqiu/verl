@@ -300,7 +300,9 @@ class AgentLoopWorker:
             tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
         outputs = await asyncio.gather(*tasks)
 
+        print(f"[DEBUG][AgentLoopWorker] outputs: {len(outputs)}")
         output = self._postprocess(outputs)
+        print(f"[DEBUG][AgentLoopWorker] output: {output.batch.keys()}")
         return output
 
     async def _run_agent_loop(
@@ -532,6 +534,19 @@ class AgentLoopManager:
         """
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
+        
+        # 生成随机索引来打乱prompts，确保数据均匀分布到各个worker
+        batch_size = len(prompts)
+        shuffle_indices = np.random.permutation(batch_size)
+        
+        # 创建逆向索引用于还原原始顺序
+        restore_indices = np.empty_like(shuffle_indices)
+        restore_indices[shuffle_indices] = np.arange(batch_size)
+        
+        # 打乱prompts顺序
+        shuffle_indices_tensor = torch.from_numpy(shuffle_indices)
+        prompts.reorder(shuffle_indices_tensor)
+        
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
@@ -540,6 +555,11 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
+        
+        # 还原到原始顺序
+        restore_indices_tensor = torch.from_numpy(restore_indices)
+        output.reorder(restore_indices_tensor)
+        
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
 
@@ -548,6 +568,7 @@ class AgentLoopManager:
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing}
+        print(f"[DEBUF] output: {output.batch.keys()}")
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import re
+import random
 from typing import Any
 
 import datasets
@@ -107,6 +108,15 @@ class CustomRLHFDataset(RLHFDataset):
 def compute_score(data_source, solution_str, ground_truth, extra_info):
     # use \\boxed{...} answer
     result = math_dapo.compute_score(solution_str, ground_truth, strict_box_verify=True)
+
+    if random.random() < 0.01:
+        print("\n" + "="*80)
+        print("🔍 [Debug Sample]")
+        print("-"*80)
+        print(f"🤖 Model Response: {solution_str}")
+        print(f"✅ Ground Truth: {ground_truth}")
+        print(f"📊 Evaluation Result: Score={result}")
+        print("="*80 + "\n")
 
     # encourage model to call tools
     num_turns = extra_info["num_turns"]

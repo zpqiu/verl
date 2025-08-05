@@ -14,6 +14,7 @@
 import asyncio
 import json
 import logging
+import random
 import os
 from abc import ABC, abstractmethod
 
@@ -87,8 +88,11 @@ class HermesToolParser(ToolParser):
     async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
         loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
+        
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             return text, []
+
+        # print(f"[DEBUF] text: {text}")
 
         matches = self.tool_call_regex.findall(text)
         function_calls = []
