@@ -797,7 +797,7 @@ class AgentLoopManager:
             )
         print(f"[AgentLoopManager] Created {len(self.agent_loop_workers)} AgentLoopWorkers, all using the same global server manager")
 
-    def generate_sequences(self, prompts: DataProto, expected_prompt_num: int = None) -> tuple[DataProto, set]:
+    def generate_sequences(self, prompts: DataProto, expected_prompt_num: int = None) -> DataProto:
         """Split input batch and dispatch to agent loop workers with early stopping support.
 
         Args:
@@ -805,7 +805,7 @@ class AgentLoopManager:
             expected_prompt_num (int, optional): Expected number of prompts to complete, triggers early stopping when reached
 
         Returns:
-            tuple[DataProto, set]: (Output batch, set of completed sample indices)
+            DataProto: Output batch.
         """
         # print prompts keys for debug
         print(f"[AgentLoopManager] expected_prompt_num: {expected_prompt_num}")

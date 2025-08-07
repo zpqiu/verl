@@ -389,5 +389,4 @@ class AsyncvLLMServer(AsyncServerBase):
             # print(f"[DEBUG] Running request ids: {running_request_ids[:10]}")
             for request_id in running_request_ids:
                 await self.engine.abort(request_id)
-            self.engine.output_processor.abort_requests(running_request_ids)
             await asyncio.sleep(0.1)
