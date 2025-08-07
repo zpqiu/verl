@@ -35,8 +35,7 @@ from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.profiler import simple_timer
 from verl.utils.reward_score.math_dapo import compute_score
-from verl.utils.rollout_trace import (RolloutTraceConfig, rollout_trace_attr,
-                                      rollout_trace_op)
+from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.async_server import async_server_class
 
 logger = logging.getLogger(__file__)
@@ -46,7 +45,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 @ray.remote
 class EarlyStoppingCoordinator:
     """Global state manager for coordinating early stopping mechanism"""
-    
+
     def __init__(self, expected_prompt_num: int):
         self.expected_prompt_num = expected_prompt_num
         self.completed_prompts = set()  # Set of completed prompt sample_indices
@@ -54,10 +53,10 @@ class EarlyStoppingCoordinator:
         self.should_stop = False
         self.lock = threading.Lock()
         print(f"[EarlyStoppingCoordinator] Initialized: expected_prompt_num={expected_prompt_num}")
-    
+
     def report_completion(self, sample_index: int, is_valid: bool) -> bool:
         """Report completion status of a prompt
-        
+
         Args:
             sample_index: sample_index of the completed prompt
             is_valid: whether it's valid
@@ -67,27 +66,35 @@ class EarlyStoppingCoordinator:
         with self.lock:
             if self.should_stop:
                 return True
-            
+
             if is_valid:
                 self.completed_prompts.add(sample_index)
             else:
                 self.invalid_prompt_count += 1
-            
+
             completed_count = len(self.completed_prompts)
-            
+
             if completed_count >= self.expected_prompt_num:
                 self.should_stop = True
-                print(f"[EarlyStoppingCoordinator] Early stopping triggered: {completed_count}/{self.expected_prompt_num} prompts completed, invalid prompt count: {self.invalid_prompt_count}")
+                print(
+                    f"[EarlyStoppingCoordinator] Early stopping triggered: "
+                    f"{completed_count}/{self.expected_prompt_num} prompts completed, "
+                    f"invalid prompt count: {self.invalid_prompt_count}"
+                )
                 return True
             else:
-                print(f"[EarlyStoppingCoordinator] Progress update: {completed_count}/{self.expected_prompt_num} prompts completed, invalid prompt count: {self.invalid_prompt_count}")
+                print(
+                    f"[EarlyStoppingCoordinator] Progress update: "
+                    f"{completed_count}/{self.expected_prompt_num} prompts completed, "
+                    f"invalid prompt count: {self.invalid_prompt_count}"
+                )
                 return False
-    
+
     def should_stop_generation(self) -> bool:
         """Check whether generation should stop"""
         with self.lock:
             return self.should_stop
-    
+
     def get_completed_prompts(self) -> set:
         """Get the set of completed prompts"""
         with self.lock:
@@ -118,7 +125,7 @@ class GlobalLoadBalancer:
         self._semaphore = threading.Semaphore(self.total_capacity)
         self._current_loads = [0] * num_servers  # Track current load of each server
         self._lock = threading.Lock()  # Protect concurrent access to _current_loads
-        
+
         print(f"[GlobalLoadBalancer] max_loads_per_server: {self.max_loads_per_server}")
         print(f"[GlobalLoadBalancer] total_capacity: {self.total_capacity}")
 
@@ -135,13 +142,13 @@ class GlobalLoadBalancer:
         if self.config.actor_rollout_ref.rollout.get("load_balance", False):
             # Acquire semaphore permission
             self._semaphore.acquire()
-            
+
             # Select server with minimum load
             with self._lock:
                 min_load_idx = min(range(self.num_servers), key=lambda i: self._current_loads[i])
                 self._current_loads[min_load_idx] += 1
                 server_index = min_load_idx
-                
+
             return server_index
         else:
             return self._choose_server_index(request_id)
@@ -154,7 +161,7 @@ class GlobalLoadBalancer:
             with self._lock:
                 if self._current_loads[server_index] > 0:
                     self._current_loads[server_index] -= 1
-                    
+
             # Release semaphore permission
             self._semaphore.release()
 
@@ -177,7 +184,7 @@ class GlobalLoadBalancer:
             # Reset load counts for all servers
             self._current_loads = [0] * self.num_servers
 
-        print(f"[GlobalLoadBalancer] Load balancer state reset")
+        print("[GlobalLoadBalancer] Load balancer state reset")
 
 
 class AsyncLLMServerManager:
@@ -186,7 +193,12 @@ class AsyncLLMServerManager:
     Gets server allocation through global load balancer
     """
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], global_load_balancer: ray.actor.ActorHandle):
+    def __init__(
+        self,
+        config: DictConfig,
+        server_handles: list[ray.actor.ActorHandle],
+        global_load_balancer: ray.actor.ActorHandle,
+    ):
         """Initialize the AsyncLLMServerManager.
 
         Args:
@@ -220,7 +232,7 @@ class AsyncLLMServerManager:
         server_index = await self.global_load_balancer.get_server_index.remote(request_id)
         server = self.server_handles[server_index]
         output = None
-        
+
         try:
             output = await server.generate_with_cancel.remote(
                 request_id=request_id,
@@ -233,7 +245,7 @@ class AsyncLLMServerManager:
         finally:
             # Ensure server index is released even if exception occurs (now synchronous call)
             await self.global_load_balancer.release_server_index.remote(server_index)
-        
+
         return output
 
 
@@ -254,6 +266,7 @@ class RewardOutput(BaseModel):
 
 class AgentLoopOutput(BaseModel):
     """Agent loop output."""
+
     rollout_index: int = -1
     prompt_ids: list[int]
     response_ids: list[int]
@@ -302,11 +315,17 @@ class SingleTurnAgentLoop:
         )
         return output
 
+
 @ray.remote
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
-    def __init__(self, config: DictConfig, global_load_balancer: ray.actor.ActorHandle, server_handles: list[ray.actor.ActorHandle]):
+    def __init__(
+        self,
+        config: DictConfig,
+        global_load_balancer: ray.actor.ActorHandle,
+        server_handles: list[ray.actor.ActorHandle],
+    ):
         """Initialize agent loop manager.
 
         Args:
@@ -334,7 +353,9 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
         )
 
-    async def generate_sequences(self, batch: DataProto, early_stopping_coordinator: ray.actor.ActorHandle = None) -> DataProto:
+    async def generate_sequences(
+        self, batch: DataProto, early_stopping_coordinator: ray.actor.ActorHandle = None
+    ) -> DataProto:
         """Generate sequences from agent loop with dynamic task creation and early stopping support.
 
         Args:
@@ -358,7 +379,7 @@ class AgentLoopWorker:
         """
         self.early_stopping_coordinator = early_stopping_coordinator
         is_validation = batch.meta_info.get("validate", False)
-        
+
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -388,19 +409,19 @@ class AgentLoopWorker:
 
         # Group tasks by prompt for early stopping management
         prompt_groups = self._group_by_prompt(agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params)
-        
+
         # Dynamic task creation and management
         completed_outputs = {}
         pending_tasks = {}  # task -> sample_index mapping
-        
+
         # Create pending prompt queue (using list to maintain order)
         pending_prompts = list(prompt_groups.items())
-        
+
         # Set maximum concurrent tasks (configurable)
         max_concurrent_tasks = self.max_concurrent_prompts
         print(f"[AgentLoopWorker] Dynamic task creation mode, max concurrent tasks: {max_concurrent_tasks}")
         print(f"[AgentLoopWorker] Total {len(pending_prompts)} prompt groups to process")
-        
+
         # Initially create a batch of tasks
         created_task_count = 0
         for _ in range(min(max_concurrent_tasks, len(pending_prompts))):
@@ -420,19 +441,22 @@ class AgentLoopWorker:
                 if early_stopping_coordinator:
                     should_stop = await early_stopping_coordinator.should_stop_generation.remote()
                     if should_stop:
-                        print(f"[AgentLoopWorker] Early stopping signal detected, cancelling {len(pending_tasks)} running tasks and {len(pending_prompts)} pending tasks")
+                        print(
+                            f"[AgentLoopWorker] Early stopping signal detected, "
+                            f"cancelling {len(pending_tasks)} running tasks and {len(pending_prompts)} pending tasks"
+                        )
                         # Cancel all pending tasks
                         for task in pending_tasks:
                             task.cancel()
                         break
-                
+
                 # Wait for any task to complete
                 done, still_pending = await asyncio.wait(
-                    pending_tasks.keys(), 
+                    pending_tasks.keys(),
                     return_when=asyncio.FIRST_COMPLETED,
-                    timeout=0.1  # Short timeout to periodically check early stopping status
+                    timeout=0.1,  # Short timeout to periodically check early stopping status
                 )
-                
+
                 # Process completed tasks
                 for task in done:
                     completed_sample_index = pending_tasks.pop(task)
@@ -445,17 +469,17 @@ class AgentLoopWorker:
                         else:
                             completed_outputs[sample_index] = outputs
                             print(f"[AgentLoopWorker] Prompt {sample_index} completed, output {len(outputs)} samples")
-                            
+
                             # Report completion status to coordinator
                             if early_stopping_coordinator:
                                 await early_stopping_coordinator.report_completion.remote(sample_index, is_valid=True)
-                            
+
                     except asyncio.CancelledError:
                         print(f"[AgentLoopWorker] Task {completed_sample_index} cancelled")
                     except Exception as e:
                         print(f"[AgentLoopWorker] Task {completed_sample_index} failed: {e}")
                         raise e
-                
+
                 # Create a new task for each completed task (if there are pending prompts)
                 new_tasks_created = 0
                 for _ in range(len(done)):
@@ -464,9 +488,9 @@ class AgentLoopWorker:
                         if early_stopping_coordinator:
                             should_stop = await early_stopping_coordinator.should_stop_generation.remote()
                             if should_stop:
-                                print(f"[AgentLoopWorker] Early stopping signal detected, stop creating new tasks")
+                                print("[AgentLoopWorker] Early stopping signal detected, stop creating new tasks")
                                 break
-                        
+
                         sample_index, group_data = pending_prompts.pop(0)
                         task = asyncio.create_task(
                             self._run_prompt_group(sample_index, group_data, do_filter=not is_validation)
@@ -474,13 +498,24 @@ class AgentLoopWorker:
                         pending_tasks[task] = sample_index
                         new_tasks_created += 1
                         created_task_count += 1
-                        print(f"[AgentLoopWorker] Dynamically created new task {created_task_count}: prompt {sample_index}")
-                
+                        print(
+                            f"[AgentLoopWorker] Dynamically created new task {created_task_count}: "
+                            f"prompt {sample_index}"
+                        )
+
                 if new_tasks_created > 0:
-                    print(f"[AgentLoopWorker] Created {new_tasks_created} new tasks this round, current running tasks: {len(pending_tasks)}")
-                
-                print(f"[AgentLoopWorker] Task status - Running: {len(pending_tasks)}, Pending: {len(pending_prompts)}, Completed: {len(completed_outputs)}")
-                
+                    print(
+                        f"[AgentLoopWorker] Created {new_tasks_created} new tasks this round, "
+                        f"current running tasks: {len(pending_tasks)}"
+                    )
+
+                print(
+                    f"[AgentLoopWorker] Task status - "
+                    f"Running: {len(pending_tasks)}, "
+                    f"Pending: {len(pending_prompts)}, "
+                    f"Completed: {len(completed_outputs)}"
+                )
+
         except Exception as e:
             # Ensure all remaining tasks are cancelled on exception
             for task in pending_tasks:
@@ -490,12 +525,12 @@ class AgentLoopWorker:
             if pending_tasks:
                 await asyncio.gather(*pending_tasks.keys(), return_exceptions=True)
             raise e
-        
+
         # Only process completed outputs
         if not completed_outputs:
             # If no completed outputs, return empty result
             return None
-            
+
         all_outputs = []
         for sample_index in sorted(completed_outputs.keys()):
             all_outputs.extend(completed_outputs[sample_index])
@@ -506,17 +541,21 @@ class AgentLoopWorker:
     def _group_by_prompt(self, agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params):
         """Group data by prompt sample_index"""
         prompt_groups = defaultdict(list)
-        
-        for i, (agent_name, messages, ground_truth, trajectory) in enumerate(zip(agent_names, raw_prompts, ground_truths, trajectory_info, strict=True)):
+
+        for i, (agent_name, messages, ground_truth, trajectory) in enumerate(
+            zip(agent_names, raw_prompts, ground_truths, trajectory_info, strict=True)
+        ):
             sample_index = trajectory["sample_index"]
-            prompt_groups[sample_index].append({
-                "agent_name": agent_name,
-                "messages": messages.tolist(),
-                "ground_truth": ground_truth,
-                "trajectory": trajectory,
-                "sampling_params": sampling_params
-            })
-        
+            prompt_groups[sample_index].append(
+                {
+                    "agent_name": agent_name,
+                    "messages": messages.tolist(),
+                    "ground_truth": ground_truth,
+                    "trajectory": trajectory,
+                    "sampling_params": sampling_params,
+                }
+            )
+
         return prompt_groups
 
     async def _run_prompt_group(self, sample_index: int, group_data: list, do_filter: bool = True):
@@ -525,15 +564,15 @@ class AgentLoopWorker:
         for data in group_data:
             task = asyncio.create_task(
                 self._run_agent_loop(
-                    data["agent_name"], 
-                    data["messages"], 
+                    data["agent_name"],
+                    data["messages"],
                     data["ground_truth"],
-                    data["sampling_params"], 
-                    data["trajectory"]
+                    data["sampling_params"],
+                    data["trajectory"],
                 )
             )
             tasks.append(task)
-        
+
         try:
             # Wait for all samples to complete
             outputs = await asyncio.gather(*tasks)
@@ -544,7 +583,7 @@ class AgentLoopWorker:
             # Check if all samples have identical reward.reward, if so, this prompt is invalid
             if do_filter and all(output.reward.reward == outputs[0].reward.reward for output in outputs):
                 return sample_index, []
-            
+
             return sample_index, outputs
         except asyncio.CancelledError:
             # print(f"[_run_prompt_group] Prompt {sample_index} cancelled, cancelling {len(tasks)} subtasks")
@@ -552,13 +591,13 @@ class AgentLoopWorker:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            
+
             # Wait for all subtask cancellations to complete
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass  # Ignore exceptions during cancellation
-            
+
             # print(f"[_run_prompt_group] All subtasks for prompt {sample_index} cancelled")
             raise  # Re-raise CancelledError
 
@@ -583,7 +622,7 @@ class AgentLoopWorker:
 
     def _compute_reward(self, ground_truth: str, output: AgentLoopOutput) -> RewardOutput:
         response_str = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
-        
+
         ori_response_str = response_str
 
         eos_token = self.tokenizer.eos_token
@@ -596,13 +635,13 @@ class AgentLoopWorker:
 
         # print some samples
         if random.randint(0, 1024) < 1:
-            print("\n" + "="*80)
+            print("\n" + "=" * 80)
             print("🔍 [Debug Sample]")
-            print("-"*80)
+            print("-" * 80)
             print(f"🤖 Model Response: {ori_response_str}")
             print(f"✅ Ground Truth: {ground_truth}")
             print(f"📊 Evaluation Result: Score={reward:.2f} | Accuracy={acc:.2f} | Prediction={pred}")
-            print("="*80 + "\n")
+            print("=" * 80 + "\n")
 
         if self.config.actor_rollout_ref.rollout.overlong_buffer.enable:
             overlong_buffer_len = self.config.actor_rollout_ref.rollout.overlong_buffer.len
@@ -610,9 +649,8 @@ class AgentLoopWorker:
             exceed_len = len(output.response_ids) - expected_len
             overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer.penalty_factor
             overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
-            # print(f"[AgentLoop][DEBUG] reward: {reward}, response_len: {len(output.response_ids)}, overlong_buffer_len: {overlong_buffer_len}, exceed_len: {exceed_len}, overlong_penalty_factor: {overlong_penalty_factor}, overlong_reward: {overlong_reward}")
             reward += overlong_reward
-        
+
         return RewardOutput(reward=reward, acc=acc, pred=pred)
 
     def _postprocess(self, inputs: list[AgentLoopOutput]) -> DataProto:
@@ -644,9 +682,9 @@ class AgentLoopWorker:
             return_attention_mask=True,
         )
         response_ids, response_attention_mask = outputs["input_ids"], outputs["attention_mask"]
-        valid_response_lengths = [ len(input.response_ids) for input in inputs ]
+        valid_response_lengths = [len(input.response_ids) for input in inputs]
         print(f"[AgentLoop][DEBUG] max valid_response_lengths: {max(valid_response_lengths)}")
-        
+
         # response_mask
         outputs = self.tokenizer.pad(
             [{"input_ids": input.response_mask} for input in inputs],
@@ -668,7 +706,7 @@ class AgentLoopWorker:
         reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32)
         reward_extra_info = defaultdict(list)
         for i, input in enumerate(inputs):
-            reward_tensor[i, valid_response_lengths[i]-1] = input.reward.reward
+            reward_tensor[i, valid_response_lengths[i] - 1] = input.reward.reward
             reward_extra_info["acc"].append(input.reward.acc)
             reward_extra_info["pred"].append(input.reward.pred)
             reward_extra_info["score"].append(input.reward.reward)
@@ -708,7 +746,9 @@ async def get_trajectory_info(step, index, rollout_index):
             rollout_n += 1
         else:
             rollout_n = 0
-        trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n, "rollout_index": rollout_index[i]})
+        trajectory_info.append(
+            {"step": step, "sample_index": index[i], "rollout_n": rollout_n, "rollout_index": rollout_index[i]}
+        )
     return trajectory_info
 
 
@@ -795,26 +835,33 @@ class AgentLoopManager:
                     name=f"agent_loop_worker_{i}",
                 ).remote(self.config, self.global_load_balancer, self.async_llm_servers)
             )
-        print(f"[AgentLoopManager] Created {len(self.agent_loop_workers)} AgentLoopWorkers, all using the same global server manager")
+        print(
+            f"[AgentLoopManager] Created {len(self.agent_loop_workers)} AgentLoopWorkers, "
+            "all using the same global server manager"
+        )
 
     def generate_sequences(self, prompts: DataProto, expected_prompt_num: int = None) -> DataProto:
         """Split input batch and dispatch to agent loop workers with early stopping support.
 
         Args:
             prompts (DataProto): Input batch.
-            expected_prompt_num (int, optional): Expected number of prompts to complete, triggers early stopping when reached
+            expected_prompt_num (int, optional): Expected number of prompts to complete,
+                triggers early stopping when reached.
 
         Returns:
             DataProto: Output batch.
         """
         # print prompts keys for debug
         print(f"[AgentLoopManager] expected_prompt_num: {expected_prompt_num}")
-        print(f"[AgentLoopManager] prompts keys: {prompts.batch.keys()} non_tensor_batch: {prompts.non_tensor_batch.keys()}")
-        
+        print(
+            f"[AgentLoopManager] prompts keys: {prompts.batch.keys()} "
+            f"non_tensor_batch: {prompts.non_tensor_batch.keys()}"
+        )
+
         # Reset global load balancer at the beginning of each generate call
         ray.get(self.global_load_balancer.reset.remote())
-        print(f"[AgentLoopManager] Reset global load balancer")
-        
+        print("[AgentLoopManager] Reset global load balancer")
+
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
 
@@ -828,7 +875,7 @@ class AgentLoopManager:
 
         # Group by prompt and assign to workers, ensuring samples from the same prompt go to the same worker
         worker_chunks = self._split_by_prompt(prompts)
-        
+
         # Start all worker tasks
         worker_tasks = []
         for i, chunk in enumerate(worker_chunks):
@@ -889,12 +936,12 @@ class AgentLoopManager:
             indices = prompts.non_tensor_batch["index"]
         else:
             indices = np.arange(len(prompts))
-        
+
         # Group by sample_index
         prompt_groups = defaultdict(list)
         for i, sample_index in enumerate(indices):
             prompt_groups[sample_index].append(i)
-        
+
         # Debug info: show prompt distribution
         unique_prompts = list(prompt_groups.keys())
         print(f"[AgentLoopManager] Total {len(unique_prompts)} unique prompts")
@@ -903,7 +950,7 @@ class AgentLoopManager:
         num_workers = len(self.agent_loop_workers)
         worker_assignments = [[] for _ in range(num_workers)]
         worker_prompt_counts = [0] * num_workers  # Track number of prompts assigned to each worker
-        
+
         # Fix: use sample_index value instead of enumeration order for assignment
         for worker_idx, (sample_index, sample_indices) in enumerate(prompt_groups.items()):
             target_worker = worker_idx % num_workers  # Restore original logic
@@ -918,11 +965,14 @@ class AgentLoopManager:
                 # Create worker's data subset
                 chunk = prompts.select_idxs(indices_to_select)
                 worker_chunks.append(chunk)
-                print(f"[AgentLoopManager] Worker {worker_idx} assigned {len(indices_to_select)} samples ({worker_prompt_counts[worker_idx]} prompts)")
+                print(
+                    f"[AgentLoopManager] Worker {worker_idx} assigned {len(indices_to_select)} samples "
+                    f"({worker_prompt_counts[worker_idx]} prompts)"
+                )
             else:
                 worker_chunks.append(None)  # This worker has no assigned tasks
                 print(f"[AgentLoopManager] Worker {worker_idx} has no assigned tasks")
-        
+
         return worker_chunks
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

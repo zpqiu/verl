@@ -30,14 +30,14 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (compute_data_metrics,
-                                           compute_throughout_metrics,
-                                           compute_timing_metrics,
-                                           process_validation_metrics,
-                                           reduce_metrics)
-from verl.trainer.ppo.ray_trainer import (RayPPOTrainer, Role,
-                                          apply_kl_penalty, compute_advantage,
-                                          compute_response_mask)
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    process_validation_metrics,
+    reduce_metrics,
+)
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.utils.profiler import marked_timer
 
 
@@ -398,7 +398,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         # get early stopping configuration
                         expected_prompt_num = self.config.data.train_batch_size
                         if batch:
-                            expected_prompt_num -= (len(batch) // self.config.actor_rollout_ref.rollout.n)
+                            expected_prompt_num -= len(batch) // self.config.actor_rollout_ref.rollout.n
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch, expected_prompt_num)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -409,7 +409,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # repeat to align with repeated responses in rollout
                     new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                     # handle the mismatch between new_batch and gen_batch_output
+                    # handle the mismatch between new_batch and gen_batch_output
                     if expected_prompt_num is not None:
                         completed_rollout_index = gen_batch_output.non_tensor_batch["rollout_index"]
                         # filter out the prompts that are not completed
