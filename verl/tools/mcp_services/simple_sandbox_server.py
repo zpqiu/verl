@@ -110,15 +110,31 @@ async def execute_python(code: str) -> Dict[str, Any]:
     """
     Execute Python code in a secure sandbox
     
+    CRITICAL CODE GENERATION RULES:
+    1. CODE PURITY: Generate ONLY executable Python code. NO comments, explanations, or thinking process in the code parameter.
+    2. THINKING SEPARATION: Do your thinking BEFORE calling this tool, not inside the code parameter.
+    3. CLEAN OUTPUT: The code should be production-ready, without any meta-commentary.
+    
     IMPORTANT CODING GUIDELINES:
     - Avoid using f-strings (f"...") as they frequently cause SyntaxError: unterminated f-string literal
     - Use .format() method or % formatting instead: "Hello {}".format(name) or "Hello %s" % name
     - Use print() statements with comma-separated values: print("Value:", variable)
     - For string concatenation, use + operator: "Hello " + str(variable)
     - Always ensure proper string escaping and quote matching
+    - NO inline comments explaining your thought process
+    - NO TODO comments or placeholder comments
+    - Code should be self-contained and immediately executable
+    
+    EXAMPLES OF WHAT NOT TO DO:
+    ❌ BAD: "# First, I need to calculate the sum\nresult = 1 + 2\n# Now I'll print the result\nprint(result)"
+    ❌ BAD: "# This solves the problem by...\nimport math\nmath.sqrt(16)"
+    
+    EXAMPLES OF CORRECT USAGE:
+    ✅ GOOD: "result = 1 + 2\nprint(result)"
+    ✅ GOOD: "import math\nprint(math.sqrt(16))"
     
     Args:
-        code: Python code to execute
+        code: Pure Python code to execute (NO comments or explanations)
         
     Returns:
         Dict containing:
@@ -140,7 +156,7 @@ async def execute_python(code: str) -> Dict[str, Any]:
     try:
         sb = await get_sandbox()
         code = _prepare_code_for_execution(code)
-        result = await sb.execute(code)
+        result = await sb.execute(code, timeout_seconds=30, memory_limit_mb=1024)
         
         return {
             "success": result.status == "success",

@@ -59,8 +59,10 @@ class CustomSandboxFusionTool(SandboxFusionTool):
         return result, None, None
 
 
-answer_format = """\nThe answer format must be: \\boxed{'The final answer goes here.'}"""
+answer_format = "\nPlease reason step by step, and put your final answer within \\boxed{}."
 
+temp_prefix = "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
+temp_suffix = "\n\nRemember to put your answer on its own line after \"Answer:\"."
 
 class CustomRLHFDataset(RLHFDataset):
     """Custom dataset class to process Maxwell-Jia/AIME_2024, yentinglin/aime_2025 datasets."""
@@ -100,7 +102,7 @@ class CustomRLHFDataset(RLHFDataset):
 
     def map_fn2(self, row: dict):
         content = row["prompt"][0]["content"]
-        row["prompt"][0]["content"] = content + answer_format
+        row["prompt"][0]["content"] = content[len(temp_prefix):-len(temp_suffix)] + answer_format
         row["agent_name"] = "tool_agent"
         return row
 

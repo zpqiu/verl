@@ -179,7 +179,7 @@ class PythonExecutorTool(MCPBaseTool):
         
         return "\n".join(formatted_result), metadata
     
-    def _filter_loading_messages(self, text: str) -> str:
+    def _filter_loading_messages_old(self, text: str) -> str:
         """
         过滤掉 Pyodide 环境的 Loading/Loaded 消息
         示例：
@@ -203,6 +203,23 @@ class PythonExecutorTool(MCPBaseTool):
         text = text.strip()
         
         return text
+
+    def _filter_loading_messages(self, text: str) -> str:
+        """
+        过滤掉旧格式的 Loading/Loaded 消息
+        """
+        import re
+        
+        sentences = text.split("\n")
+        i = 0
+        while i < len(sentences):
+            sentence = sentences[i]
+            if sentence.strip().startswith("Loading") or sentence.strip().startswith("Loaded"):
+                i += 1
+                continue
+            break
+        sentences = sentences[i:]
+        return "\n".join(sentences)
 
     def _parse_json_result(self, result_data: dict, metadata: dict) -> tuple[str, dict]:
         """
@@ -233,7 +250,7 @@ class PythonExecutorTool(MCPBaseTool):
         
         # 添加标准输出
         if stdout.strip():
-            formatted_result.append(f"\n📤 Output:\n{stdout}")
+            formatted_result.append(f"\n📤 Output:\n{stdout.strip()}")
             metadata["has_output"] = True
         
         # 添加错误输出
