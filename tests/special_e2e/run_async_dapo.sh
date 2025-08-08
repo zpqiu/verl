@@ -30,15 +30,15 @@ enable_filter_groups=True
 filter_groups_metric=seq_reward
 max_num_gen_batches=10
 
-train_traj_micro_bsz_per_gpu=2 # b
-n_resp_per_prompt=2 # g
+train_traj_micro_bsz_per_gpu=1 # b
+n_resp_per_prompt=4 # g
 
 train_traj_micro_bsz=$((train_traj_micro_bsz_per_gpu * NUM_GPUS)) # b * n
 train_traj_mini_bsz=$((train_traj_micro_bsz * 2)) # 2 * b * n
 train_prompt_mini_bsz=$((train_traj_mini_bsz * n_resp_per_prompt)) # 2 * b * n / g
-train_prompt_bsz=$((train_prompt_mini_bsz * 2)) # 4 * b * n / g
+train_prompt_bsz=$((train_prompt_mini_bsz)) # 4 * b * n / g
 
-gen_prompt_bsz=$((train_prompt_bsz * 2))
+gen_prompt_bsz=$((train_prompt_bsz * 16))
 
 agent_num_workers=${AGENT_NUM_WORKERS:-4}
 
@@ -50,6 +50,7 @@ export VLLM_USE_V1=1
 python3 -m recipe.async_dapo.main_dapo \
     data.train_files="${HOME}/data/gsm8k/train.parquet" \
     data.val_files="${HOME}/data/gsm8k/test.parquet" \
+    data.return_raw_chat=True \
     reward_model.reward_manager=dapo \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
