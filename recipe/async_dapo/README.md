@@ -2,7 +2,7 @@
 
 ## Overview
 
-Inspired by MiMo, this Async DAPO recipe combines veRL's AgentLoop async rollout functionality with the DAPO algorithm to enhance end-to-end training efficiency. This recipe provides efficient distributed processing with intelligent resource management, early stopping mechanisms, and dynamic task scheduling for single-turn RLVR.
+Inspired by MiMo, this Async DAPO recipe combines verl's AgentLoop async rollout functionality with the DAPO algorithm to enhance end-to-end training efficiency. This recipe provides efficient distributed processing with intelligent resource management, early stopping mechanisms, and dynamic task scheduling for single-turn RLVR.
 
 ## Key Features
 
@@ -13,13 +13,13 @@ Inspired by MiMo, this Async DAPO recipe combines veRL's AgentLoop async rollout
 
 ## Usage
 
-### 0. Install veRL
+### 0. Install verl
 
 ```bash
 git clone https://github.com/volcengine/verl
 cd verl
 # !IMPORTANT: checkout the commit, otherwise there may be incompatibility issues
-git checkout ac826e0558017a9c675818f36cbb3473c14a2a50
+git checkout 6110410797986ccfbfb375ffdec2453d4ff90e59
 pip install -e .
 ```
 
@@ -211,7 +211,6 @@ Overall throughput has improved by about 10%, and the time spent in the rollout 
 ## References and Acknowledgments
 
 - [MiMo](https://arxiv.org/abs/2505.07608): We implement the early stopping mechanism and seamless reward computation & filtering based on MiMo's design.
-- [veRL](https://github.com/volcengine/verl): We use veRL's AgentLoop async rollout functionality as the baseline and the training framework.
 - [DAPO](https://github.com/BytedTsinghua-SIA/DAPO): We use the DAPO dataset as the data.
 - [Qwen3-8B-Base](https://huggingface.co/Qwen/Qwen3-8B-Base): We use Qwen3-8B-Base as the model.
 - [Irvingwangjr/verl](https://github.com/Irvingwangjr/verl): For the generation cancellation mechanism in the AsyncvLLMServer, we refer to the implementation in this repo.

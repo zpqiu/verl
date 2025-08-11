@@ -549,7 +549,7 @@ class AgentLoopWorker:
             prompt_groups[sample_index].append(
                 {
                     "agent_name": agent_name,
-                    "messages": messages.tolist(),
+                    "messages": messages,
                     "ground_truth": ground_truth,
                     "trajectory": trajectory,
                     "sampling_params": sampling_params,
