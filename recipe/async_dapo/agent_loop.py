@@ -39,7 +39,13 @@ from verl.utils.reward_score.math_dapo import compute_score
 from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.async_server import async_server_class
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, _DummyConfig, AgentLoopOutput
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopBase,
+    _DummyConfig,
+    AgentLoopOutput,
+    _agent_loop_registry,
+    register,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -278,23 +284,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     valid_response_length: int = 0
 
 
-"""Agent loop registry: key is agent_name, value is a dict of agent loop config
-used by hydra.utils.instantiate to initialize agent loop instance.
-
-https://hydra.cc/docs/advanced/instantiate_objects/overview/
-"""
-_agent_loop_registry: dict[str, dict] = {}
-
-
-def register(agent_name: str):
-    """Register agent loop class."""
-
-    def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
-        fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
-        _agent_loop_registry[agent_name] = {"_target_": fqdn}
-        return subclass
-
-    return decorator
+"""Agent loop registry and register are re-exported from
+`verl.experimental.agent_loop.agent_loop` to keep a single global registry."""
 
 
 @ray.remote
