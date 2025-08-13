@@ -19,11 +19,13 @@ import random
 from typing import Any
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+
+from recipe.async_dapo.agent_loop import register
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -79,6 +81,8 @@ class ToolAgentLoop(AgentLoopBase):
                 response_ids = await self.server_manager.generate(
                     request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
                 )
+                if response_ids is None:
+                    return None
             prompt_ids += response_ids
             response_mask += [1] * len(response_ids)
             assistant_turns += 1

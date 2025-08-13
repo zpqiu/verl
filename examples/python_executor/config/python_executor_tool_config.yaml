@@ -1,7 +1,7 @@
 tools:
   - class_name: verl.tools.python_executor_tool.PythonExecutorTool
     config:
-      rate_limit: 60  # 每分钟最多60次请求
+      rate_limit: 40  # 每分钟最多60次请求
       timeout: 20     # 60秒超时
       type: mcp
     mcp:

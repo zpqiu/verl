@@ -1007,6 +1007,49 @@ class DataProto:
             return f"ndarray{value.shape} ({value.dtype})"
         return type(value).__name__
 
+    def repeat_with_uid_suffix(self, repeat_times=2):
+        """
+        Repeat the batch data a specified number of times, adding a unique suffix based on repeat count.
+
+        Args:
+            repeat_times (int): Number of times to repeat the data.
+            interleave (bool): Whether to interleave the repeated data.
+
+        Returns:
+            DataProto: A new DataProto with repeated data and suffixed keys.
+        """
+        # process batch tensor
+        if self.batch is not None:
+            # interleaved reepated
+            repeated_tensors = {
+                key: tensor.repeat_interleave(repeat_times, dim=0)
+                for key, tensor in self.batch.items()
+            }
+            repeated_batch = TensorDict(
+                source=repeated_tensors,
+                batch_size=(self.batch.batch_size[0] * repeat_times,),
+            )
+        else:
+            repeated_batch = None
+
+        # process non tensor
+        repeated_non_tensor_batch = {}
+        for key, val in self.non_tensor_batch.items():
+            new_val = np.repeat(val, repeat_times, axis=0)
+            if key == "uid":
+                new_uids = new_val.copy()
+                for i in range(0, repeat_times):
+                    mask = np.arange(i, len(new_uids), repeat_times)
+                    new_uids[mask] = [f"{uid}_{i}" for uid in new_uids[mask]]
+                # Repeat the modified uids
+                new_val = new_uids
+            repeated_non_tensor_batch[key] = new_val
+
+        return DataProto(
+            batch=repeated_batch,
+            non_tensor_batch=repeated_non_tensor_batch,
+            meta_info=self.meta_info,
+        )
 
 @dataclass
 class DataProtoFuture:

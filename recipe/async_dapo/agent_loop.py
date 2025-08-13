@@ -21,12 +21,13 @@ from collections import defaultdict
 from typing import Any
 from uuid import uuid4
 
+import hydra
 import numpy as np
 import ray
 import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
@@ -37,6 +38,8 @@ from verl.utils.profiler import simple_timer
 from verl.utils.reward_score.math_dapo import compute_score
 from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.async_server import async_server_class
+
+from verl.experimental.agent_loop.agent_loop import AgentLoopBase, _DummyConfig, AgentLoopOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -249,13 +252,6 @@ class AsyncLLMServerManager:
         return output
 
 
-class AgentLoopMetrics(BaseModel):
-    """Agent loop performance metrics."""
-
-    generate_sequences: float = 0.0
-    tool_calls: float = 0.0
-
-
 class RewardOutput(BaseModel):
     """Reward output."""
 
@@ -264,56 +260,41 @@ class RewardOutput(BaseModel):
     pred: str = ""
 
 
-class AgentLoopOutput(BaseModel):
-    """Agent loop output."""
+class _InternalAgentLoopOutput(AgentLoopOutput):
+    """Internal agent loop output with padded sequences."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    prompt_ids: torch.Tensor
+    """Padded prompt token ids."""
+    response_ids: torch.Tensor
+    """Padded response token ids."""
+    response_mask: torch.Tensor
+    """Padded response mask."""
+    attention_mask: torch.Tensor
+    """Padded attention mask."""
     rollout_index: int = -1
-    prompt_ids: list[int]
-    response_ids: list[int]
-    response_mask: list[int]
-    num_turns: int = 0
-    metrics: AgentLoopMetrics
     reward: RewardOutput = RewardOutput()
+    valid_response_length: int = 0
 
 
-# the config API has been changed, so we need to use the old API
-# class SingleTurnAgentLoop(AgentLoopBase):
-class SingleTurnAgentLoop:
-    """Naive agent loop that only do single turn chat completion."""
+"""Agent loop registry: key is agent_name, value is a dict of agent loop config
+used by hydra.utils.instantiate to initialize agent loop instance.
 
-    def __init__(self, config, server_manager, tokenizer):
-        # super().__init__(config, server_manager, tokenizer)
-        self.prompt_length = config.actor_rollout_ref.rollout.prompt_length
-        self.response_length = config.actor_rollout_ref.rollout.response_length
-        # self.reward_fn = reward_fn
-        self.server_manager = server_manager
-        self.tokenizer = tokenizer
-        self.loop = asyncio.get_running_loop()
+https://hydra.cc/docs/advanced/instantiate_objects/overview/
+"""
+_agent_loop_registry: dict[str, dict] = {}
 
-    async def run(self, messages: list[dict[str, Any]], sampling_params: dict[str, Any]) -> AgentLoopOutput:
-        metrics = {}
-        request_id = uuid4().hex
-        prompt_ids = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
-        )
 
-        with simple_timer("generate_sequences", metrics):
-            response_ids = await self.server_manager.generate(
-                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
-            )
-        if response_ids is None:
-            return None
-        response_mask = [1] * len(response_ids)
+def register(agent_name: str):
+    """Register agent loop class."""
 
-        output = AgentLoopOutput(
-            prompt_ids=prompt_ids,
-            response_ids=response_ids[: self.response_length],
-            response_mask=response_mask[: self.response_length],
-            num_turns=2,
-            metrics=metrics,
-            # reward=ret,
-        )
-        return output
+    def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
+        fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
+        _agent_loop_registry[agent_name] = {"_target_": fqdn}
+        return subclass
+
+    return decorator
 
 
 @ray.remote
@@ -396,19 +377,16 @@ class AgentLoopWorker:
         if "agent_name" not in batch.non_tensor_batch:
             batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
 
-        agent_names = batch.non_tensor_batch["agent_name"]
-        raw_prompts = batch.non_tensor_batch["raw_prompt"]
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
         else:
-            index = np.arange(len(raw_prompts))
+            index = np.arange(len(batch))
         rollout_index = batch.non_tensor_batch["rollout_index"]
-        ground_truths = [item.non_tensor_batch["reward_model"]["ground_truth"] for item in batch]
 
         trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index, rollout_index)
 
         # Group tasks by prompt for early stopping management
-        prompt_groups = self._group_by_prompt(agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params)
+        prompt_groups = self._group_by_prompt(batch, trajectory_info, sampling_params)
 
         # Dynamic task creation and management
         completed_outputs = {}
@@ -538,19 +516,16 @@ class AgentLoopWorker:
         output = self._postprocess(all_outputs)
         return output
 
-    def _group_by_prompt(self, agent_names, raw_prompts, ground_truths, trajectory_info, sampling_params):
+    def _group_by_prompt(self, batch, trajectory_info, sampling_params):
         """Group data by prompt sample_index"""
         prompt_groups = defaultdict(list)
 
-        for i, (agent_name, messages, ground_truth, trajectory) in enumerate(
-            zip(agent_names, raw_prompts, ground_truths, trajectory_info, strict=True)
-        ):
+        for i, (item, trajectory) in enumerate(zip(batch, trajectory_info, strict=True)):
             sample_index = trajectory["sample_index"]
+            kwargs = {k: v[i] for k, v in item.non_tensor_batch.items()}
             prompt_groups[sample_index].append(
                 {
-                    "agent_name": agent_name,
-                    "messages": messages,
-                    "ground_truth": ground_truth,
+                    "kwargs": kwargs,
                     "trajectory": trajectory,
                     "sampling_params": sampling_params,
                 }
@@ -564,11 +539,9 @@ class AgentLoopWorker:
         for data in group_data:
             task = asyncio.create_task(
                 self._run_agent_loop(
-                    data["agent_name"],
-                    data["messages"],
-                    data["ground_truth"],
                     data["sampling_params"],
                     data["trajectory"],
+                    **data["kwargs"],
                 )
             )
             tasks.append(task)
@@ -603,22 +576,104 @@ class AgentLoopWorker:
 
     async def _run_agent_loop(
         self,
-        agent_name: str,
-        messages: list[dict[str, Any]],
-        ground_truth: str,
         sampling_params: dict[str, Any],
         trajectory: dict[str, Any],
-    ) -> AgentLoopOutput:
+        *,
+        agent_name: str,
+        **kwargs,
+    ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
-            step=trajectory["step"], sample_index=trajectory["sample_index"], rollout_n=trajectory["rollout_n"]
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=trajectory["rollout_n"],
+            validate=trajectory["validate"],
+            name="agent_loop",
         ):
-            agent_loop = SingleTurnAgentLoop(self.config, self.server_manager, self.tokenizer)
-            output = await agent_loop.run(messages, sampling_params)
+            assert agent_name in _agent_loop_registry, (
+                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+            )
+
+            agent_loop_config = _agent_loop_registry[agent_name]
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                trainer_config=_DummyConfig(config=self.config),
+                server_manager=self.server_manager,
+                tokenizer=self.tokenizer,
+            )
+            output = await agent_loop.run(sampling_params, **kwargs)
             if output is None:
                 return None
-            output.reward = self._compute_reward(ground_truth, output)
-            output.rollout_index = trajectory["rollout_index"]
-            return output
+
+            ground_truth = kwargs["reward_model"]["ground_truth"]
+            reward = self._compute_reward(ground_truth, output)
+
+            # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
+            # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
+            # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
+            # input_ids: concatenation of prompt + response
+            # Mask:
+            # For example, if the prompt is [1,2,3,4] and the response is [5,6,7,(tool start)8,9(tool end),10,11,12]
+            # - prompt_attention_mask: 0s for padding, 1s for tokens
+            #   e.g., [0,0,0,0,1,1,1,1]
+            # - response_attention_mask: 0s for padding, 1s for tokens
+            #   e.g., [1,1,1,1,1,1,1,1,1,1,1,0,0,0,0]
+            # attention_mask: concatenation of prompt_attention_mask and response_attention_mask
+            #   e.g., [0,0,0,0,1,1,1,1(prompt),1,1,1,1,1,1,1,1,1,1,1,0,0,0,0(response)]
+            # - response_mask: 1s for LLM generated tokens, 0 for tool response/padding tokens
+            #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
+            # - position_ids: sequential positions for tokens, starting at 0
+            #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
+
+            self.tokenizer.padding_side = "left"
+            prompt_output = self.tokenizer.pad(
+                {"input_ids": output.prompt_ids},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if prompt_output["input_ids"].dim() == 1:
+                prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
+                prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+
+            self.tokenizer.padding_side = "right"
+            valid_response_length = len(output.response_ids)
+            response_output = self.tokenizer.pad(
+                {"input_ids": output.response_ids},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if response_output["input_ids"].dim() == 1:
+                response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
+                response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+
+            response_mask_output = self.tokenizer.pad(
+                {"input_ids": output.response_mask},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.response_length,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )
+            if response_mask_output["input_ids"].dim() == 1:
+                response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+
+            response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+
+            attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
+
+            return _InternalAgentLoopOutput(
+                prompt_ids=prompt_output["input_ids"],
+                response_ids=response_output["input_ids"],
+                response_mask=response_mask,
+                attention_mask=attention_mask,
+                num_turns=output.num_turns,
+                metrics=output.metrics,
+                rollout_index=trajectory["rollout_index"],
+                reward=reward,
+                valid_response_length=valid_response_length,
+            )
 
     def _compute_reward(self, ground_truth: str, output: AgentLoopOutput) -> RewardOutput:
         response_str = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
@@ -653,60 +708,24 @@ class AgentLoopWorker:
 
         return RewardOutput(reward=reward, acc=acc, pred=pred)
 
-    def _postprocess(self, inputs: list[AgentLoopOutput]) -> DataProto:
-        # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
-        # prompts: left pad
-        # responses: right pad
-        # input_ids: prompt + response
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-
-        # prompts
-        self.tokenizer.padding_side = "left"
-        outputs = self.tokenizer.pad(
-            [{"input_ids": input.prompt_ids} for input in inputs],
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        prompt_ids, prompt_attention_mask = outputs["input_ids"], outputs["attention_mask"]
-
-        # responses
-        self.tokenizer.padding_side = "right"
-        outputs = self.tokenizer.pad(
-            [{"input_ids": input.response_ids} for input in inputs],
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        response_ids, response_attention_mask = outputs["input_ids"], outputs["attention_mask"]
-        valid_response_lengths = [len(input.response_ids) for input in inputs]
-        print(f"[AgentLoop][DEBUG] max valid_response_lengths: {max(valid_response_lengths)}")
-
-        # response_mask
-        outputs = self.tokenizer.pad(
-            [{"input_ids": input.response_mask} for input in inputs],
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=False,
-        )
-        response_mask = outputs["input_ids"]
-        assert response_ids.shape == response_mask.shape, (
-            f"mismatch in response_ids and response_mask shape: {response_ids.shape} vs {response_mask.shape}"
-        )
-        response_mask = response_mask * response_attention_mask
+    def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
+        """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        # Convert lists back to tensors and stack them to create a batch.
+        prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
+        response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
+        response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
+        attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
 
         input_ids = torch.cat([prompt_ids, response_ids], dim=1)
-        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
+
+        valid_response_lengths = [input.valid_response_length for input in inputs]
+        print(f"[AgentLoop][DEBUG] max valid_response_lengths: {max(valid_response_lengths)}")
 
         reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32)
         reward_extra_info = defaultdict(list)
         for i, input in enumerate(inputs):
-            reward_tensor[i, valid_response_lengths[i] - 1] = input.reward.reward
+            reward_tensor[i, input.valid_response_length - 1] = input.reward.reward
             reward_extra_info["acc"].append(input.reward.acc)
             reward_extra_info["pred"].append(input.reward.pred)
             reward_extra_info["score"].append(input.reward.reward)
@@ -721,19 +740,18 @@ class AgentLoopWorker:
                 "position_ids": position_ids,  # [bsz, prompt_length + response_length]
                 "token_level_scores": reward_tensor,
             },
-            batch_size=len(input_ids),
+            batch_size=len(inputs),
         )
 
         num_turns = np.array([input.num_turns for input in inputs], dtype=np.int32)
-        rollout_index = np.array([input.rollout_index for input in inputs], dtype=np.int32)
         metrics = [input.metrics.model_dump() for input in inputs]
+        rollout_index = np.array([input.rollout_index for input in inputs], dtype=np.int32)
         non_tensor_batch = {
             "__num_turns__": num_turns,
             "rollout_index": rollout_index,
         }
         for key, value in reward_extra_info.items():
             non_tensor_batch[key] = np.array(value)
-
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": metrics})
 
 
