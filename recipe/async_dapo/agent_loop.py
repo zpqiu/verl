@@ -319,6 +319,7 @@ class AgentLoopWorker:
         self.server_manager = AsyncLLMServerManager(config, server_handles, global_load_balancer)
         self.early_stopping_coordinator = None  # Early stopping coordinator, set during generate_sequences
         self.max_concurrent_prompts = config.actor_rollout_ref.rollout.get("max_concurrent_prompts", 32)
+        self.do_filter = config.algorithm.filter_groups.enable
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -406,7 +407,7 @@ class AgentLoopWorker:
             if pending_prompts:
                 sample_index, group_data = pending_prompts.pop(0)
                 task = asyncio.create_task(
-                    self._run_prompt_group(sample_index, group_data, do_filter=not is_validation)
+                    self._run_prompt_group(sample_index, group_data, do_filter=self.do_filter and not is_validation)
                 )
                 pending_tasks[task] = sample_index
                 created_task_count += 1

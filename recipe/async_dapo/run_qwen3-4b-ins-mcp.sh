@@ -38,11 +38,12 @@ actor_lr=1e-6
 max_num_batched_tokens=$(( (max_prompt_length + max_response_length) ))
 
 train_batch_size=512
+gen_batch_size=1024
 ppo_mini_batch_size=64
 n_resp_per_prompt=8
 n_resp_per_prompt_val=32
 
-enable_filter_groups=True
+enable_filter_groups=False
 filter_groups_metric=acc
 max_num_gen_batches=20
 
@@ -72,6 +73,7 @@ python3 -m recipe.async_dapo.main_dapo \
     data.val_files="$test_files" \
     data.return_raw_chat=True \
     data.train_batch_size=$train_batch_size \
+    data.gen_batch_size=$gen_batch_size \
     data.max_prompt_length=$max_prompt_length \
     data.max_response_length=$max_response_length \
     data.filter_overlong_prompts=True \
