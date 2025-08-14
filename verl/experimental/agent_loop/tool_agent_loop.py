@@ -82,6 +82,7 @@ class ToolAgentLoop(AgentLoopBase):
                     request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
                 )
                 if response_ids is None:
+                    print(f"[INVALID] Prompt {request_id}")
                     return None
             prompt_ids += response_ids
             response_mask += [1] * len(response_ids)

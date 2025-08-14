@@ -375,7 +375,7 @@ class AgentLoopWorker:
             index = np.arange(len(batch))
         rollout_index = batch.non_tensor_batch["rollout_index"]
 
-        trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index, rollout_index)
+        trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index, rollout_index, batch.meta_info.get("validate", False))
 
         # Group tasks by prompt for early stopping management
         prompt_groups = self._group_by_prompt(batch, trajectory_info, sampling_params)
@@ -514,7 +514,7 @@ class AgentLoopWorker:
 
         for i, (item, trajectory) in enumerate(zip(batch, trajectory_info, strict=True)):
             sample_index = trajectory["sample_index"]
-            kwargs = {k: v[i] for k, v in item.non_tensor_batch.items()}
+            kwargs = {k: v for k, v in item.non_tensor_batch.items()}
             prompt_groups[sample_index].append(
                 {
                     "kwargs": kwargs,
@@ -543,6 +543,7 @@ class AgentLoopWorker:
             outputs = await asyncio.gather(*tasks)
 
             if any(output is None for output in outputs):
+                print(f"[INVALID] Prompt {sample_index}")
                 return sample_index, []
 
             # Check if all samples have identical reward.reward, if so, this prompt is invalid
@@ -594,6 +595,7 @@ class AgentLoopWorker:
             )
             output = await agent_loop.run(sampling_params, **kwargs)
             if output is None:
+                print(f"[INVALID] Prompt {trajectory['sample_index']}, raw_prompt: {kwargs['raw_prompt']}")
                 return None
 
             ground_truth = kwargs["reward_model"]["ground_truth"]
@@ -690,13 +692,13 @@ class AgentLoopWorker:
             print(f"📊 Evaluation Result: Score={reward:.2f} | Accuracy={acc:.2f} | Prediction={pred}")
             print("=" * 80 + "\n")
 
-        if self.config.actor_rollout_ref.rollout.overlong_buffer.enable:
-            overlong_buffer_len = self.config.actor_rollout_ref.rollout.overlong_buffer.len
-            expected_len = self.config.actor_rollout_ref.rollout.response_length - overlong_buffer_len
-            exceed_len = len(output.response_ids) - expected_len
-            overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer.penalty_factor
-            overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
-            reward += overlong_reward
+        # if self.config.actor_rollout_ref.rollout.overlong_buffer.enable:
+        #     overlong_buffer_len = self.config.actor_rollout_ref.rollout.overlong_buffer.len
+        #     expected_len = self.config.actor_rollout_ref.rollout.response_length - overlong_buffer_len
+        #     exceed_len = len(output.response_ids) - expected_len
+        #     overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer.penalty_factor
+        #     overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+        #     reward += overlong_reward
 
         return RewardOutput(reward=reward, acc=acc, pred=pred)
 
@@ -747,7 +749,7 @@ class AgentLoopWorker:
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": metrics})
 
 
-async def get_trajectory_info(step, index, rollout_index):
+async def get_trajectory_info(step, index, rollout_index, validate):
     """Get the trajectory info (step, sample_index, rollout_n) asynchrously"""
     trajectory_info = []
     rollout_n = 0
@@ -757,7 +759,7 @@ async def get_trajectory_info(step, index, rollout_index):
         else:
             rollout_n = 0
         trajectory_info.append(
-            {"step": step, "sample_index": index[i], "rollout_n": rollout_n, "rollout_index": rollout_index[i]}
+            {"step": step, "sample_index": index[i], "rollout_n": rollout_n, "rollout_index": rollout_index[i], "validate": validate}
         )
     return trajectory_info
 
