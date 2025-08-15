@@ -75,7 +75,7 @@ class CustomRLHFDataset(RLHFDataset):
             data_source = "/".join(parquet_file.split("/")[-2:])
             if data_source in ["Maxwell-Jia/AIME_2024", "yentinglin/aime_2025"]:
                 dataframe = dataframe.map(
-                    self.map_fn, fn_kwargs={"data_source": data_source}, remove_columns=dataframe.column_names
+                    self.map_fn, fn_kwargs={"data_source": data_source}, remove_columns=dataframe.column_names, with_indices=True
                 )
             else:
                 dataframe = dataframe.map(self.map_fn2, num_proc=16)
@@ -84,7 +84,7 @@ class CustomRLHFDataset(RLHFDataset):
 
         print(f"dataset len: {len(self.dataframe)}")
 
-    def map_fn(self, row: dict, *, data_source: str = None):
+    def map_fn(self, row: dict, index: int, *, data_source: str = None):
         if data_source == "Maxwell-Jia/AIME_2024":
             problem, answer = row["Problem"], row["Answer"]
         elif data_source == "yentinglin/aime_2025":
@@ -97,6 +97,7 @@ class CustomRLHFDataset(RLHFDataset):
             "ability": "MATH",
             "reward_model": {"ground_truth": str(answer)},
             "agent_name": "tool_agent",
+            "extra_info": {"index": index},
         }
         return data
 

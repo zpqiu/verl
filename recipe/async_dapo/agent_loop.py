@@ -110,7 +110,7 @@ class EarlyStoppingCoordinator:
             return self.completed_prompts.copy()
 
 
-@ray.remote(concurrency_groups={"acquire": 1, "release": 10, "reset": 1})
+@ray.remote(concurrency_groups={"acquire": 256, "release": 256, "reset": 1})
 class GlobalLoadBalancer:
     """
     Global load balancer that only handles server index allocation, not actual generate calls
@@ -134,6 +134,9 @@ class GlobalLoadBalancer:
         self._semaphore = threading.Semaphore(self.total_capacity)
         self._current_loads = [0] * num_servers  # Track current load of each server
         self._lock = threading.Lock()  # Protect concurrent access to _current_loads
+        # epoch/reset control to preempt stale blocked acquires across steps
+        self._epoch = 0
+        self._reset_event = threading.Event()
 
         print(f"[GlobalLoadBalancer] max_loads_per_server: {self.max_loads_per_server}")
         print(f"[GlobalLoadBalancer] total_capacity: {self.total_capacity}")
@@ -149,8 +152,17 @@ class GlobalLoadBalancer:
     def get_server_index(self, request_id: str) -> int:
         """Get the server index that should be used"""
         if self.config.actor_rollout_ref.rollout.get("load_balance", False):
-            # Acquire semaphore permission
-            self._semaphore.acquire()
+            # print(f"[GlobalLoadBalancer] get_server_index: {request_id}")
+            # Acquire semaphore permission with timeout so we can observe reset/epoch changes
+            local_epoch = self._epoch
+            while True:
+                acquired = self._semaphore.acquire(timeout=0.1)
+                if acquired:
+                    break
+                # If a reset occurred, abort this stale acquire so caller can retry
+                if self._epoch != local_epoch or self._reset_event.is_set():
+                    raise RuntimeError("LOAD_BALANCER_RESET")
+            # print(f"[GlobalLoadBalancer] get_server_index: {request_id} acquired semaphore")
 
             # Select server with minimum load
             with self._lock:
@@ -188,10 +200,15 @@ class GlobalLoadBalancer:
     def reset(self):
         """Reset load balancer state, including semaphore and load counts"""
         with self._lock:
+            # Signal reset and move to next epoch so in-flight acquires can bail out
+            self._epoch += 1
+            self._reset_event.set()
             # Recreate semaphore
             self._semaphore = threading.Semaphore(self.total_capacity)
             # Reset load counts for all servers
             self._current_loads = [0] * self.num_servers
+        # Clear reset signal after state is ready
+        self._reset_event.clear()
 
         print("[GlobalLoadBalancer] Load balancer state reset")
 
@@ -237,23 +254,37 @@ class AsyncLLMServerManager:
         Returns:
             List[int]: List of generated token ids.
         """
+        # print(f"[AsyncLLMServerManager] generate: {request_id}")
         # Get server index from global load balancer (now synchronous call)
-        server_index = await self.global_load_balancer.get_server_index.remote(request_id)
-        server = self.server_handles[server_index]
+        server_index = None
+        server = None
         output = None
 
         try:
+            # light retry to handle LOAD_BALANCER_RESET signal
+            for _ in range(3):
+                try:
+                    server_index = await self.global_load_balancer.get_server_index.remote(request_id)
+                    break
+                except RuntimeError as e:
+                    if str(e) == "LOAD_BALANCER_RESET":
+                        continue
+                    raise
+            # print(f"[AsyncLLMServerManager] generate: {request_id} got server index: {server_index}")
+            server = self.server_handles[server_index]
             output = await server.generate_with_cancel.remote(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
             )
         except asyncio.CancelledError:
-            print(f"[AsyncLLMServerManager] Task cancelled: {request_id}")
-            await server.cancel.remote(request_id)
+            # print(f"[AsyncLLMServerManager] Task cancelled: {request_id}")
+            if server_index is not None:
+                await server.cancel.remote(request_id)
         finally:
             # Ensure server index is released even if exception occurs (now synchronous call)
-            await self.global_load_balancer.release_server_index.remote(server_index)
+            if server_index is not None:
+                await self.global_load_balancer.release_server_index.remote(server_index)
 
         return output
 
@@ -325,6 +356,10 @@ class AgentLoopWorker:
             trace_config.get("backend"),
             trace_config.get("token2text", False),
         )
+
+    def update_load_balancer(self, global_load_balancer: ray.actor.ActorHandle):
+        """Update the load balancer handle for this worker's server manager."""
+        self.server_manager.global_load_balancer = global_load_balancer
 
     async def generate_sequences(
         self, batch: DataProto, early_stopping_coordinator: ray.actor.ActorHandle = None
@@ -463,7 +498,11 @@ class AgentLoopWorker:
 
                         sample_index, group_data = pending_prompts.pop(0)
                         task = asyncio.create_task(
-                            self._run_prompt_group(sample_index, group_data, do_filter=not is_validation)
+                            self._run_prompt_group(
+                                sample_index,
+                                group_data,
+                                do_filter=self.do_filter and not is_validation,
+                            )
                         )
                         pending_tasks[task] = sample_index
                         new_tasks_created += 1
@@ -677,7 +716,7 @@ class AgentLoopWorker:
         eos_token = self.tokenizer.eos_token
         if response_str.endswith(eos_token):
             response_str = response_str[: -len(eos_token)]
-        ret = compute_score(response_str, ground_truth)
+        ret = compute_score(response_str, ground_truth, strict_box_verify=True)
         reward = ret["score"]
         acc = ret["acc"]
         pred = ret["pred"]
@@ -699,6 +738,15 @@ class AgentLoopWorker:
         #     overlong_penalty_factor = self.config.actor_rollout_ref.rollout.overlong_buffer.penalty_factor
         #     overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
         #     reward += overlong_reward
+
+        # encourage model to call tools
+        num_turns = output.num_turns
+        if reward < 0:
+            tool_call_reward = (num_turns - 2) / 2 * 0.1
+            reward = min(0, reward + tool_call_reward)
+
+        if pred is None:
+            pred = ""
 
         return RewardOutput(reward=reward, acc=acc, pred=pred)
 
@@ -870,9 +918,18 @@ class AgentLoopManager:
             f"non_tensor_batch: {prompts.non_tensor_batch.keys()}"
         )
 
-        # Reset global load balancer at the beginning of each generate call
-        ray.get(self.global_load_balancer.reset.remote())
-        print("[AgentLoopManager] Reset global load balancer")
+        # Recreate and broadcast a fresh global load balancer each call to avoid stale blocking
+        try:
+            ray.kill(self.global_load_balancer)
+        except Exception as e:
+            print(f"[AgentLoopManager] Failed to kill global load balancer: {e}")
+            pass
+        self.global_load_balancer = GlobalLoadBalancer.options(
+            name="global_async_llm_load_balancer",
+        ).remote(self.config, self.rollout_dp_size)
+        print("[AgentLoopManager] Recreated global load balancer")
+        # Broadcast new handle to workers
+        ray.get([worker.update_load_balancer.remote(self.global_load_balancer) for worker in self.agent_loop_workers])
 
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
