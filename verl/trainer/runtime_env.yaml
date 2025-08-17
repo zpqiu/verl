@@ -3,3 +3,4 @@ excludes: ["/.git/", "/.node_modules/"]
 env_vars:
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
   CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  USE_VLLM_V1: "1"
