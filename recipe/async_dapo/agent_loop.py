@@ -285,7 +285,6 @@ class SingleTurnAgentLoop:
         # super().__init__(config, server_manager, tokenizer)
         self.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         self.response_length = config.actor_rollout_ref.rollout.response_length
-        # self.reward_fn = reward_fn
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.loop = asyncio.get_running_loop()
@@ -311,7 +310,6 @@ class SingleTurnAgentLoop:
             response_mask=response_mask[: self.response_length],
             num_turns=2,
             metrics=metrics,
-            # reward=ret,
         )
         return output
 
@@ -586,7 +584,6 @@ class AgentLoopWorker:
 
             return sample_index, outputs
         except asyncio.CancelledError:
-            # print(f"[_run_prompt_group] Prompt {sample_index} cancelled, cancelling {len(tasks)} subtasks")
             # Cancel all subtasks
             for task in tasks:
                 if not task.done():
@@ -598,7 +595,6 @@ class AgentLoopWorker:
             except Exception:
                 pass  # Ignore exceptions during cancellation
 
-            # print(f"[_run_prompt_group] All subtasks for prompt {sample_index} cancelled")
             raise  # Re-raise CancelledError
 
     async def _run_agent_loop(
