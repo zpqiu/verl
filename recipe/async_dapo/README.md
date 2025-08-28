@@ -199,14 +199,25 @@ The `test_qwen3_8b.sh` script is just a simple example to show how to use this a
 
 The following experiments are conducted on multiple nodes and with a larger max_response_length (16k).
 
-![The training curve of Qwen3-8B-Base on DAPO dataset](assets/exp-qwen3-8b.png)
+![The training curve of Qwen3-8B-Base on DAPO dataset](https://github.com/nvidia-china-sae/mair-hub/blob/main/rl-tutorial/async_dapo/assets/exp-qwen3-8b.png?raw=true)
 
 - Green Line: using the above async DAPO recipe
 - Red Lines: the baseline, using the original AgentLoop async rollout.
 
 From the above figure, we can see that the async DAPO recipe can achieve a similar performance to the baseline, but with a much lower rollout time.
 
-Overall throughput has improved by about 10%, and the time spent in the rollout phase has decreased by 20%.
+Overall throughput has improved by about 15%, and the time spent in the rollout phase has decreased by 20%.
+
+### Additional Experiment: 8k Max Sequence Length
+
+We conducted an additional experiment using the same Qwen3-8B-Base model but with a reduced max_response_length (8k) to evaluate performance under different sequence length constraints.
+
+![Training results with 8k max sequence length](https://github.com/nvidia-china-sae/mair-hub/blob/main/rl-tutorial/async_dapo/assets/exp-qwen3-8b-1.png?raw=true)
+
+- Green Line: using the above async DAPO recipe
+- Yellow Lines: the baseline, using the original AgentLoop async rollout.
+
+In this 8k experiment, the async DAPO recipe boosts efficiency and yields stabilized training by favoring shorter and low variance trajectories while saving wasted compute.
 
 ## References and Acknowledgments
 
