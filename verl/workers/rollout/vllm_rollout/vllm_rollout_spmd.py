@@ -58,7 +58,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_npu_available
-from verl.utils.fp8_utils import apply_vllm_fp8_patches, load_quanted_weights, is_fp8_model 
+from verl.utils.fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
@@ -462,6 +462,7 @@ class vLLMRollout(BaseRollout):
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
             model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
             model = model_runner.model
             patch_vllm_moe_model_weight_loader(model)
@@ -476,6 +477,7 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.debug("Loading standard weights (non-FP8)")
                 model.load_weights(weights)
+
 
 # https://github.com/vllm-project/vllm/issues/13175
 def _monkey_patch_compute_logits(model, vocab_size: int):
@@ -603,6 +605,7 @@ class vLLMAsyncRollout(BaseRollout):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
         model_runner = self.inference_engine.worker.model_runner
         model = model_runner.model
         patch_vllm_moe_model_weight_loader(model)
