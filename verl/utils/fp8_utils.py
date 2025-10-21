@@ -344,7 +344,6 @@ def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Te
 
 
 def apply_vllm_fp8_patches(block_quant=True):
-    print("xueh apply_vllm_fp8_patches")
     if block_quant:
         func_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
         patcher = patch(func_path, process_weights_after_loading)
