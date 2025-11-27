@@ -293,9 +293,7 @@ class vLLMHttpServerBase:
                 }
             )
 
-        hacked_model_path = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/TensorRT-Model-Optimizer/examples/llm_ptq/Qwen/Qwen3-0.6B-nvfp4"
-
-        server_args = ["serve", hacked_model_path]
+        server_args = ["serve", self.model_config.local_path]
         for k, v in args.items():
             if isinstance(v, bool):
                 if v:
