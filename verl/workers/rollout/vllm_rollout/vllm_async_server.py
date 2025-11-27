@@ -48,6 +48,7 @@ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutpu
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 from verl.utils.fp8_utils import apply_vllm_fp8_patches
+from verl.utils.modelopt_utils import apply_vllm_modelopt_patches
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -228,6 +229,7 @@ class vLLMHttpServerBase:
                 }
                 fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
             apply_vllm_fp8_patches(block_quant=use_block_quant)
+        apply_vllm_modelopt_patches()
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
@@ -291,7 +293,9 @@ class vLLMHttpServerBase:
                 }
             )
 
-        server_args = ["serve", self.model_config.local_path]
+        hacked_model_path = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/alexq/TensorRT-Model-Optimizer/examples/llm_ptq/Qwen/Qwen3-0.6B-nvfp4"
+
+        server_args = ["serve", hacked_model_path]
         for k, v in args.items():
             if isinstance(v, bool):
                 if v:

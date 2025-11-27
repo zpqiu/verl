@@ -18,6 +18,7 @@ from typing import Optional
 from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
+from verl.workers.config.model import HFModelConfig
 from verl.utils.profiler import ProfilerConfig
 
 __all__ = [
@@ -185,6 +186,8 @@ class RolloutConfig(BaseConfig):
     enable_chunked_prefill: bool = True
 
     enable_prefix_caching: bool = True
+
+    model: Optional[HFModelConfig] = None
 
     load_format: str = "dummy"
 

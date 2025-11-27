@@ -706,7 +706,10 @@ class AgentLoopManager:
         num_replicas = world_size // rollout_world_size
 
         rollout_config = self.config.actor_rollout_ref.rollout
-        model_config = self.config.actor_rollout_ref.model
+        if rollout_config.model is not None:
+            model_config = rollout_config.model
+        else:
+            model_config = self.config.actor_rollout_ref.model
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=replica_rank,

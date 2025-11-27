@@ -76,6 +76,7 @@ from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
 from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+from verl.utils.modelopt_utils import apply_vllm_modelopt_patches
 from verl.utils.import_utils import deprecated
 from verl.utils.model import get_lora_rank_from_adapter
 from verl.utils.profiler import GPUMemoryLogger
@@ -233,7 +234,7 @@ class vLLMRollout(BaseRollout):
                 }
                 fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
             apply_vllm_fp8_patches(block_quant=use_block_quant)
-
+        apply_vllm_modelopt_patches()
         compilation_config = {}
 
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
@@ -632,6 +633,7 @@ class vLLMAsyncRollout(BaseRollout):
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
         if self.config.quantization:
             apply_vllm_fp8_patches(block_quant=self.config.use_block_quant_rollout)
+        apply_vllm_modelopt_patches()
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
 

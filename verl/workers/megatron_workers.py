@@ -408,7 +408,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+        if rollout_config.model is not None:
+            model_config = rollout_config.model
+        else:
+            model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
 
         # 2. build rollout device mesh
         infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
@@ -459,6 +462,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             import importlib
 
             importlib.import_module(self.config.model.external_lib)
+
+        if self.config.rollout.model is not None and self.config.rollout.model.get("external_lib", None) is not None:
+            import importlib
+
+            importlib.import_module(self.config.rollout.model.external_lib)
 
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -515,7 +523,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
         if self._is_rollout:
-            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            self._build_rollout()
             log_gpu_memory_usage("After rollout init", logger=logger)
 
         if self._is_ref:
