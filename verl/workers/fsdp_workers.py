@@ -90,6 +90,10 @@ from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
+import modelopt.torch.quantization as mtq
+from modelopt.torch.export.unified_export_hf import _export_quantized_weight
+from modelopt.torch.export.quant_utils import get_quantization_format
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -486,6 +490,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
+        # @zpqiu: quantize the model only when using modelopt qat.
+        # only support fsdp1
+        actor_module = mtq.quantize(actor_module, mtq.NVFP4_DEFAULT_CFG, None)
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
@@ -581,8 +588,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
-        self.model_config = model_config
+        if rollout_config.model is not None:
+            model_config = rollout_config.model
+        else:
+            model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
 
         # 2. build rollout device mesh
         infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
@@ -669,7 +678,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
-            params = self.actor_module_fsdp.state_dict()
+            # first, get original state dict
+            original_state_dict = self.actor_module_fsdp.state_dict()
+
+            # @zpqiu ========= QAT model handling =========
+            # @TODO: not fully equivalent to the original modelopt._export_hf_checkpoint()
+            # handle quantized modules separately
+            layer_prefix = "_fsdp_wrapped_module.model.layers."
+            for name, sub_module in self.actor_module_fsdp.named_modules():
+                if not name.startswith(layer_prefix) or "." in name[len(layer_prefix):]:
+                    continue
+                unwrapped_layer_name = name.replace("_fsdp_wrapped_module.", "")
+                # print(f"Unwrapped Layer Name: {unwrapped_layer_name}")
+                with FSDP.summon_full_params(sub_module, writeback=False):
+                    inner = getattr(sub_module, "_fsdp_wrapped_module", sub_module)
+                    for child_name, child_module in inner.named_modules():
+                        child_quant_format = get_quantization_format(child_module)
+                        # print(f"Child Module: {child_name} | Quant Format: {child_quant_format} | {type(child_module).__name__}")
+                        if "QuantLinear" not in type(child_module).__name__:
+                            continue
+                        if child_quant_format != None:
+                            _export_quantized_weight(child_module, torch.float32)
+                            child_module_state_dict = child_module.state_dict()
+                            for k, v in child_module_state_dict.items():
+                                new_k = f"{unwrapped_layer_name}.{child_name}.{k}"
+                                original_state_dict[new_k] = v
+                                # print(f"New Key: {new_k}, Value: {v.shape}, {v.dtype}, {type(v)}, {isinstance(v, DTensor)}")
+
+            # for k, v in original_state_dict.items():
+                # print(f"@@@@FSDP: k: {k}, v: {v.shape}, v.dtype: {v.dtype}, {type(v)}, {isinstance(v, DTensor)}")
+            # return
+            # quantized_state_dict, _ = _export_hf_checkpoint(self.actor_module_fsdp)
+
+            # for k, v in quantized_state_dict.items():
+                # print(f"@@@@ k: {k}, v: {v.shape}, v.dtype: {v.dtype}, {type(v)}, {isinstance(v, DTensor)}")
+            # @zpqiu ========= QAT model handling =========
+            params = original_state_dict
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
@@ -703,7 +747,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in params.items()
+                # @zpqiu: remove extra params
+                for name, param in params.items() if "quantizer" not in name
             )
 
         if self.config.rollout.free_cache_engine:
@@ -755,6 +800,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
+        if self.config.rollout.model is not None:
+            import_external_libs(self.config.rollout.model.get("external_lib", None))
 
         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
         use_remove_padding = self.config.model.get("use_remove_padding", False)
@@ -809,7 +856,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         if self._is_rollout:
-            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            # trust_remote_code is handled inside _build_rollout via config
+            self._build_rollout()
 
         if self._is_ref:
             ref_model_path = self.config.model.path
