@@ -1,0 +1,20 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# defaults specify the default config from each component
+defaults:
+
+  # hf model config, inheriting from trainer/config/model/hf_model.yaml
+  - hf_model
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Target class for this configuration
+_target_: verl.workers.config.RolloutModelConfig
+
+# path to the huggingface model
+path: null

@@ -706,7 +706,7 @@ class AgentLoopManager:
         num_replicas = world_size // rollout_world_size
 
         rollout_config = self.config.actor_rollout_ref.rollout
-        if rollout_config.model is not None:
+        if rollout_config.model is not None and rollout_config.model.path is not None:
             model_config = rollout_config.model
         else:
             model_config = self.config.actor_rollout_ref.model

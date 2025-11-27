@@ -18,7 +18,7 @@ from typing import Optional
 from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
-from verl.workers.config.model import HFModelConfig
+from verl.workers.config.model import RolloutModelConfig
 from verl.utils.profiler import ProfilerConfig
 
 __all__ = [
@@ -187,7 +187,7 @@ class RolloutConfig(BaseConfig):
 
     enable_prefix_caching: bool = True
 
-    model: Optional[HFModelConfig] = None
+    model: RolloutModelConfig = field(default_factory=RolloutModelConfig)
 
     load_format: str = "dummy"
 

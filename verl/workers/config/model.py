@@ -24,7 +24,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig"]
+__all__ = ["HFModelConfig", "RolloutModelConfig"]
 
 
 @dataclass
@@ -155,3 +155,13 @@ class HFModelConfig(BaseConfig):
 
     def get_processor(self):
         return self.processor if self.processor is not None else self.tokenizer
+
+
+@dataclass
+class RolloutModelConfig(HFModelConfig):
+    path: Optional[str] = None
+
+    def __post_init__(self):
+        if self.path is None:
+            return
+        super().__post_init__()

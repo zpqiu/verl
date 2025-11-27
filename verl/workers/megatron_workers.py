@@ -408,7 +408,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        if rollout_config.model is not None:
+        if rollout_config.model is not None and rollout_config.model.path is not None:
             model_config = rollout_config.model
         else:
             model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
