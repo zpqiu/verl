@@ -7,6 +7,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None:
+    if getattr(layer, "prefix", None) == "model.layers.27.mlp.gate_up_proj" or getattr(layer, "prefix", "").startswith("model.layers.27.self_attn"):
+        print(f"##VLLM##: {getattr(layer, 'prefix', None)}: {layer.params_dtype} bias: {getattr(layer, 'bias', None)} {layer.weight.data[0, :4]}, scale: {layer.weight_scale.data[0, :4]}, scale_2: {layer.weight_scale_2.data[0]}")
     from vllm.model_executor.layers.quantization.utils.quant_utils import swizzle_blockscale
     from torch.nn import Parameter
     import vllm._custom_ops as ops
@@ -35,7 +37,7 @@ def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None
 
         return param
 
-    def prepare_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+    def prepare_fp4_layer_for_marlin(layer: torch.nn.Module, weight_scale_2_max: torch.Tensor) -> None:
         logger.warning_once(
             "Your GPU does not have native support for FP4 computation but "
             "FP4 quantization is being used. Weight-only FP4 compression will "
@@ -55,7 +57,8 @@ def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None
         device = layer.weight.device
 
         # WORKSPACE
-        layer.workspace = marlin_make_workspace_new(device)
+        if getattr(layer, "workspace", None) is None:
+            layer.workspace = marlin_make_workspace_new(device)
 
         # WEIGHT
         # Repack weights to marlin format
@@ -87,7 +90,7 @@ def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None
             weight_scale = nvfp4_marlin_process_scales(weight_scale)
             layer.marlin_weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
-            weight_scale_2 = layer.weight_scale_2.to(param_dtype)
+            weight_scale_2 = weight_scale_2_max.to(param_dtype)
             weight_scale_2 = nvfp4_marlin_process_global_scale(weight_scale_2)
             layer.marlin_weight_scale_2 = torch.nn.Parameter(weight_scale_2, requires_grad=False)
         else:
@@ -102,13 +105,15 @@ def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None
         return
 
     # global scales:
-    input_scale_2 = layer.input_scale.max().to(torch.float32)
+    input_scale_2 = layer.input_scale.data
     layer.input_scale = _create_param_from_subclass_attributes(input_scale_2, layer.input_scale)
+    input_scale_2_max = input_scale_2.max().to(torch.float32)
 
-    weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+    weight_scale_2 = layer.weight_scale_2.data
     layer.weight_scale_2 = _create_param_from_subclass_attributes(weight_scale_2, layer.weight_scale_2)
+    weight_scale_2_max = weight_scale_2.max().to(torch.float32)
 
-    layer.alpha = Parameter(layer.input_scale * layer.weight_scale_2,
+    layer.alpha = Parameter(input_scale_2_max * weight_scale_2_max,
                             requires_grad=False)
 
     # Calculate `1 / input_scale` so that we don't need to do so at runtime
@@ -126,9 +131,13 @@ def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None
         weight_scale = layer.weight_scale.data
         layer.weight = _create_param_from_subclass_attributes(weight, layer.weight)
         layer.weight_scale = _create_param_from_subclass_attributes(weight_scale, layer.weight_scale)
-        prepare_fp4_layer_for_marlin(layer)
+        prepare_fp4_layer_for_marlin(layer, weight_scale_2_max)
+
+        if getattr(layer, "prefix", None) == "model.layers.27.mlp.gate_up_proj" or getattr(layer, "prefix", "").startswith("model.layers.27.self_attn"):
+            print(f"##VLLM-MARLIN##: {getattr(layer, 'prefix', None)}: {layer.marlin_weight.data[0, :4]}, scale: {layer.marlin_weight_scale.data[0, :4]}, scale_2: {layer.marlin_weight_scale_2.data}")
+
         del layer.alpha
-        del layer.input_scale
+        # del layer.input_scale
     elif self.backend == "flashinfer-trtllm":
         # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
         # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -154,6 +163,93 @@ def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None
         layer.weight = _create_param_from_subclass_attributes(layer.weight.data, layer.weight)
 
 
+def process_weights_after_loading_kv(self, layer) -> None:
+    """Modified version of BaseKVCacheMethod.process_weights_after_loading.
+
+    Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
+    for dynamic updates during refit.
+    """
+    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
+    # regardless whether the kv-scale is available in the checkpoint.
+    # No need to process kv scales after loading if we are going to
+    # calculate them on the fly.
+    from vllm.platforms import current_platform
+
+    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+            # We prefer to use separate k_scale and v_scale if present
+            k_scale = layer.k_scale.to("cpu").tolist()
+            v_scale = layer.v_scale.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+            # If no scales were loaded (both scales are invalid negative
+            # values), use the default value of 1.0
+            k_scale = 1.0
+            v_scale = 1.0
+        else:
+            # If we find a single kv_scale in the checkpoint, we remap
+            # kv_scale to k_scale during weight loading, and duplicate
+            # k_scale to v_scale here
+            assert layer.k_scale > 0.0
+            scale_to_duplicate = max(layer.k_scale, layer.v_scale)
+            k_scale = scale_to_duplicate.to("cpu").tolist()
+            v_scale = scale_to_duplicate.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+
+        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+
+        if layer.q_scale < 0.0:
+            layer._q_scale.copy_(k_scale)
+            layer._q_scale_float = k_scale
+
+        # These are used in the final Attention.forward()
+        layer._k_scale.copy_(k_scale)
+        layer._v_scale.copy_(v_scale)
+        layer._k_scale_float = k_scale
+        layer._v_scale_float = v_scale
+
+    if layer.q_scale > 0.0:
+        q_scale = layer.q_scale
+        if current_platform.is_fp8_fnuz():
+            q_scale *= 2
+        layer.calculate_kv_scales = False
+    else:
+        q_scale = 1.0
+    if layer.prob_scale > 0.0:
+        prob_scale = layer.prob_scale
+        if current_platform.is_fp8_fnuz():
+            prob_scale *= 2
+    else:
+        prob_scale = 1.0
+
+    is_singleton_float = (
+        lambda x: isinstance(x, float)
+        or isinstance(x, torch.Tensor)
+        and x.numel() == 1
+        and x.is_floating_point()
+    )
+    if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
+        raise ValueError(
+            "Only support per-tensor scaling factorfor fp8-quantized Q/prob"
+        )
+
+    # These are used in the final Attention.forward()
+    layer._q_scale.copy_(q_scale)
+    layer._q_scale_float = (
+        q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
+    )
+
+    layer._prob_scale.copy_(prob_scale)
+
+    # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
+    # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
+
+
 def apply_modelopt(
     self,
     layer: torch.nn.Module,
@@ -164,6 +260,8 @@ def apply_modelopt(
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import apply_fp4_marlin_linear
     from vllm.utils.flashinfer import (flashinfer_scaled_fp4_mm)
     if self.backend == "marlin":
+        # if getattr(layer, "prefix", None) == "model.layers.27.mlp.gate_up_proj" or getattr(layer, "prefix", "").startswith("model.layers.27.self_attn"):
+            # print(f"##VLLM-MARLIN##: {getattr(layer, 'prefix', None)}: {layer.marlin_weight.data[0, :4]}, scale: {layer.marlin_weight_scale.data[0, :4]}, scale_2: {layer.marlin_weight_scale_2.data}")
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.marlin_weight,
@@ -214,3 +312,7 @@ def apply_vllm_modelopt_patches():
     func2_path = "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4LinearMethod.apply"
     patcher2 = patch(func2_path, apply_modelopt)
     patcher2.start()
+    # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
+    func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+    patcher5 = patch(func5_path, process_weights_after_loading_kv)
+    patcher5.start()

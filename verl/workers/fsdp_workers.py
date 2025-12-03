@@ -29,6 +29,7 @@ import torch
 import torch.distributed
 import torch.distributed as dist
 from codetiming import Timer
+import modelopt.torch.quantization as mtq
 from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
@@ -81,6 +82,7 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
+from verl.utils.modelopt_export_utils import OnlineQuantExporter
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -89,10 +91,6 @@ from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfi
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
-
-import modelopt.torch.quantization as mtq
-from modelopt.torch.export.unified_export_hf import _export_quantized_weight
-from modelopt.torch.export.quant_utils import get_quantization_format
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -490,9 +488,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        # @zpqiu: quantize the model only when using modelopt qat.
-        # only support fsdp1
-        actor_module = mtq.quantize(actor_module, mtq.NVFP4_DEFAULT_CFG, None)
+        
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
@@ -534,6 +530,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             full_state = actor_module.state_dict()
             apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
             fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
+            actor_module = mtq.quantize(actor_module, mtq.NVFP4_DEFAULT_CFG, None)
+            self.exporter = OnlineQuantExporter(actor_module)
             actor_module_fsdp = actor_module
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
@@ -678,42 +676,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
-            # first, get original state dict
-            original_state_dict = self.actor_module_fsdp.state_dict()
-
-            # @zpqiu ========= QAT model handling =========
-            # @TODO: not fully equivalent to the original modelopt._export_hf_checkpoint()
-            # handle quantized modules separately
-            layer_prefix = "_fsdp_wrapped_module.model.layers."
-            for name, sub_module in self.actor_module_fsdp.named_modules():
-                if not name.startswith(layer_prefix) or "." in name[len(layer_prefix):]:
-                    continue
-                unwrapped_layer_name = name.replace("_fsdp_wrapped_module.", "")
-                # print(f"Unwrapped Layer Name: {unwrapped_layer_name}")
-                with FSDP.summon_full_params(sub_module, writeback=False):
-                    inner = getattr(sub_module, "_fsdp_wrapped_module", sub_module)
-                    for child_name, child_module in inner.named_modules():
-                        child_quant_format = get_quantization_format(child_module)
-                        # print(f"Child Module: {child_name} | Quant Format: {child_quant_format} | {type(child_module).__name__}")
-                        if "QuantLinear" not in type(child_module).__name__:
-                            continue
-                        if child_quant_format != None:
-                            _export_quantized_weight(child_module, torch.float32)
-                            child_module_state_dict = child_module.state_dict()
-                            for k, v in child_module_state_dict.items():
-                                new_k = f"{unwrapped_layer_name}.{child_name}.{k}"
-                                original_state_dict[new_k] = v
-                                # print(f"New Key: {new_k}, Value: {v.shape}, {v.dtype}, {type(v)}, {isinstance(v, DTensor)}")
-
-            # for k, v in original_state_dict.items():
-                # print(f"@@@@FSDP: k: {k}, v: {v.shape}, v.dtype: {v.dtype}, {type(v)}, {isinstance(v, DTensor)}")
-            # return
-            # quantized_state_dict, _ = _export_hf_checkpoint(self.actor_module_fsdp)
-
-            # for k, v in quantized_state_dict.items():
-                # print(f"@@@@ k: {k}, v: {v.shape}, v.dtype: {v.dtype}, {type(v)}, {isinstance(v, DTensor)}")
-            # @zpqiu ========= QAT model handling =========
-            params = original_state_dict
+            # include raw modelopt quantizer params
+            params = self.actor_module_fsdp.state_dict()
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
@@ -745,11 +709,76 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                # @zpqiu: remove extra params
-                for name, param in params.items() if "quantizer" not in name
-            )
+            # per_tensor_param = (
+            #     (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+            #     for name, param in params.items()
+            # )
+
+            # @zpqiu: custom exporter =======================================================
+            # Generator way to process params by layer, avoid OOM
+            import re
+            from collections import defaultdict
+
+            def quantized_param_generator(params, exporter, device):
+                # 1. group params by layer on CPU
+                # must ensure the params of the same layer (group) are together, so that the export can handle fusion (like QKV) correctly
+                layers_groups = defaultdict(dict)
+                non_layer_params = {}
+
+                for name, param in params.items():
+                    # match the .layers.{i}. pattern
+                    match = re.search(r"\.layers\.(\d+)\.", name)
+                    if match:
+                        idx = int(match.group(1))
+                        layers_groups[idx][name] = param
+                    else:
+                        non_layer_params[name] = param
+
+                # 2. define the batch processing function: move to GPU -> Export -> Yield -> release
+                def process_batch(batch_params):
+                    if not batch_params:
+                        return
+                    
+                    per_tensor_param_dict = {
+                        name: (param.to(device, non_blocking=True).full_tensor() 
+                               if isinstance(param, DTensor) else param)
+                        for name, param in batch_params.items()
+                    }
+                    
+                    # export (quantize)
+                    # exporter.export will process this batch of params, return the quantized dict
+                    quantized_dict = exporter.export(per_tensor_param_dict)
+                    
+                    for k, v in quantized_dict.items():
+                        sample_data = v
+                        # @zpqiu: DEBUG PRINTING =======================================================
+                        if len(v.shape) == 2 and v.shape[0] > 14200:
+                            sample_data = v[14190, :4]
+                        elif len(v.shape) == 2:
+                            sample_data = v[128, :4]
+                        elif len(v.shape) == 1:
+                            sample_data = v[:4]
+                        print(f"DEBUG SYNC: {k}, {sample_data} {v.shape}, {type(v)}")
+                        # @zpqiu: DEBUG PRINTING end =======================================================
+                        yield k, v
+                    
+                    # explicitly clean, ensure the memory is released
+                    del per_tensor_param_dict
+                    del quantized_dict
+                    # torch.cuda.empty_cache() # 如果显存依然紧张，可以取消注释
+
+                # 3. generate params by layer order
+                
+                # first process the non-layer params (embeddings, norms, head, etc.)
+                yield from process_batch(non_layer_params)
+                
+                # then process the layer params by order
+                for idx in sorted(layers_groups.keys()):
+                    yield from process_batch(layers_groups[idx])
+
+            per_tensor_param = quantized_param_generator(params, self.exporter, device)
+            # @zpqiu: custom exporter end =======================================================
+
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
