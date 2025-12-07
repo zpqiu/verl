@@ -530,8 +530,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             full_state = actor_module.state_dict()
             apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
             fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
-            actor_module = mtq.quantize(actor_module, mtq.NVFP4_DEFAULT_CFG, None)
+            # @zpqiu: initialize =======================================================
+            # only mlp weight is quantized, other layers are not quantized
+            _default_disabled_quantizer_cfg = {
+                "nn.BatchNorm1d": {"*": {"enable": False}},
+                "nn.BatchNorm2d": {"*": {"enable": False}},
+                "nn.BatchNorm3d": {"*": {"enable": False}},
+                "nn.LeakyReLU": {"*": {"enable": False}},
+                "*lm_head*": {"enable": False},
+                "*proj_out.*": {"enable": False},  # In Whisper model, lm_head has key name proj_out
+                "*block_sparse_moe.gate*": {"enable": False},  # Skip the MOE router
+                "*router*": {"enable": False},  # Skip the MOE router
+                "*mlp.gate.*": {"enable": False},  # Skip the MOE router
+                "*mlp.shared_expert_gate.*": {"enable": False},  # Skip the MOE router
+                "*linear_attn.conv1d*": {"enable": False},
+                "*mixer.conv1d*": {"enable": False},
+                "*output_layer*": {"enable": False},
+                "output.*": {"enable": False},
+                "default": {"enable": False},
+            }
+            weight_only_cfg = {
+                "quant_cfg": {
+                    "*weight_quantizer": {
+                        "num_bits": (2, 1),
+                        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                        "axis": None,
+                        "enable": True,
+                    },
+                    "*input_quantizer": {
+                        "num_bits": (2, 1),
+                        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                        "axis": None,
+                        "enable": False,
+                    },
+                    **_default_disabled_quantizer_cfg,
+                },
+                "algorithm": "max",
+            }
+            actor_module = mtq.quantize(actor_module, weight_only_cfg, None)
             self.exporter = OnlineQuantExporter(actor_module)
+            # @zpqiu: initialize =======================================================
             actor_module_fsdp = actor_module
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
