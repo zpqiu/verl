@@ -567,8 +567,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 },
                 "algorithm": "max",
             }
-            actor_module = mtq.quantize(actor_module, weight_only_cfg, None)
-            self.exporter = OnlineQuantExporter(actor_module)
+            if self.config.actor.get("use_qat", False):
+                actor_module = mtq.quantize(actor_module, weight_only_cfg, None)
+                self.exporter = OnlineQuantExporter(actor_module)
             # @zpqiu: initialize =======================================================
             actor_module_fsdp = actor_module
         else:
@@ -747,10 +748,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            # per_tensor_param = (
-            #     (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-            #     for name, param in params.items()
-            # )
 
             # @zpqiu: custom exporter =======================================================
             # Generator way to process params by layer, avoid OOM
@@ -814,7 +811,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 for idx in sorted(layers_groups.keys()):
                     yield from process_batch(layers_groups[idx])
 
-            per_tensor_param = quantized_param_generator(params, self.exporter, device)
+            if self.config.actor.get("use_qat", False):
+                per_tensor_param = quantized_param_generator(params, self.exporter, device)
+            else:
+                per_tensor_param = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in params.items()
+                )
             # @zpqiu: custom exporter end =======================================================
 
 

@@ -233,6 +233,7 @@ class FSDPActorConfig(ActorConfig):
     use_remove_padding: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     use_rollout_log_probs: bool = False
+    use_qat: bool = False
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
