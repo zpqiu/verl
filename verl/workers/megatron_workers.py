@@ -484,17 +484,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        if rollout_config.model is not None and rollout_config.model.path is not None:
-            model_config = rollout_config.model
-        else:
-    
-            # Convert megatron lora config to HFModelConfig
-            model_config_dict = OmegaConf.to_container(self.config.model)
-            model_config_dict.pop("lora", None)
+        
+        # Convert megatron lora config to HFModelConfig
+        model_config_dict = OmegaConf.to_container(self.config.model)
+        model_config_dict.pop("lora", None)
 
-            model_config: HFModelConfig = omega_conf_to_dataclass(
-                OmegaConf.create(model_config_dict), dataclass_type=HFModelConfig
-            )
+        model_config: HFModelConfig = omega_conf_to_dataclass(
+            OmegaConf.create(model_config_dict), dataclass_type=HFModelConfig
+        )
 
         # 2. build rollout device mesh
         infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
@@ -545,11 +542,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             import importlib
 
             importlib.import_module(self.config.model.external_lib)
-
-        if self.config.rollout.model is not None and self.config.rollout.model.get("external_lib", None) is not None:
-            import importlib
-
-            importlib.import_module(self.config.rollout.model.external_lib)
 
         from verl.utils.torch_dtypes import PrecisionType
 
