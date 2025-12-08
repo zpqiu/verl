@@ -484,7 +484,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        
+
         # Convert megatron lora config to HFModelConfig
         model_config_dict = OmegaConf.to_container(self.config.model)
         model_config_dict.pop("lora", None)
