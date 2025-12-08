@@ -6,6 +6,80 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# copied from modelopt
+_default_disabled_quantizer_cfg = {
+    "nn.BatchNorm1d": {"*": {"enable": False}},
+    "nn.BatchNorm2d": {"*": {"enable": False}},
+    "nn.BatchNorm3d": {"*": {"enable": False}},
+    "nn.LeakyReLU": {"*": {"enable": False}},
+    "*lm_head*": {"enable": False},
+    "*proj_out.*": {"enable": False},  # In Whisper model, lm_head has key name proj_out
+    "*block_sparse_moe.gate*": {"enable": False},  # Skip the MOE router
+    "*router*": {"enable": False},  # Skip the MOE router
+    "*mlp.gate.*": {"enable": False},  # Skip the MOE router
+    "*mlp.shared_expert_gate.*": {"enable": False},  # Skip the MOE router
+    "*linear_attn.conv1d*": {"enable": False},
+    "*mixer.conv1d*": {"enable": False},
+    "*output_layer*": {"enable": False},
+    "output.*": {"enable": False},
+    "default": {"enable": False},
+}
+
+# customized weight only cfg for modelopt
+NVFP4_WEIGHT_ONLY_CFG = {
+    "quant_cfg": {
+        "*weight_quantizer": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+            "enable": True,
+        },
+        "*input_quantizer": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+            "enable": False,
+        },
+        **_default_disabled_quantizer_cfg,
+    },
+    "algorithm": "max",
+}
+
+# used by vllm initilization
+HF_NVFP4_WEIGHT_ONLY_CFG = {
+    "config_groups": {
+        "group_0": {
+            "input_activations": {
+                "dynamic": False,
+                "num_bits": 4,
+                "type": "float",
+                "group_size": 16
+            },
+            "weights": {
+                "dynamic": False,
+                "num_bits": 4,
+                "type": "float",
+                "group_size": 16
+            },
+            "targets": [
+                "Linear"
+            ]
+        }
+    },
+    "ignore": [
+        "lm_head",
+        "lm_head"
+    ],
+    "quant_algo": "NVFP4",
+    "producer": {
+        "name": "modelopt",
+        "version": "0.39.0"
+    },
+    "quant_method": "modelopt"
+}
+
+
+
 def process_weights_after_loading_modelopt(self, layer: torch.nn.Module) -> None:
     if getattr(layer, "prefix", None) == "model.layers.27.mlp.gate_up_proj" or getattr(layer, "prefix", "").startswith("model.layers.27.self_attn"):
         print(f"##VLLM##: {getattr(layer, 'prefix', None)}: {layer.params_dtype} bias: {getattr(layer, 'bias', None)} {layer.weight.data[0, :4]}, scale: {layer.weight_scale.data[0, :4]}, scale_2: {layer.weight_scale_2.data[0]}")

@@ -49,7 +49,7 @@ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutpu
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 from verl.utils.fp8_utils import apply_vllm_fp8_patches
-from verl.utils.modelopt_utils import apply_vllm_modelopt_patches
+from verl.utils.modelopt_utils import apply_vllm_modelopt_patches, HF_NVFP4_WEIGHT_ONLY_CFG
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -219,6 +219,7 @@ class vLLMHttpServerBase:
         )
         logger.info(f"override_generation_config: {override_generation_config}")
         quantization = self.config.quantization
+        quantization_config = None
         if quantization is not None:
             if quantization == "fp8":
                 FP8_BLOCK_QUANT_KWARGS = {
@@ -227,10 +228,13 @@ class vLLMHttpServerBase:
                     "quant_method": "fp8",
                     "weight_block_size": [128, 128],
                 }
-                fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+                quantization_config = dict(FP8_BLOCK_QUANT_KWARGS)
                 # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
+            elif quantization == "qat_nvfp4":
+                quantization_config = HF_NVFP4_WEIGHT_ONLY_CFG
+                apply_vllm_modelopt_patches()
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
         args = {
@@ -252,7 +256,7 @@ class vLLMHttpServerBase:
             "seed": self.config.get("seed", 0),
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,
-            "hf_overrides": {"quantization_config": fp8_block_quant_kwargs} if quantization == "fp8" else None,
+            "hf_overrides": {"quantization_config": quantization_config},
             **engine_kwargs,
         }
 

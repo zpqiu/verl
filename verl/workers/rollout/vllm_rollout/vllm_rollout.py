@@ -194,6 +194,9 @@ class vLLMAsyncRollout(BaseRollout):
                 # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
+            elif self.config.quantization == "qat_nvfp4":
+                from verl.utils.modelopt_utils import apply_vllm_modelopt_patches
+                apply_vllm_modelopt_patches()
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {self.config.quantization}")
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
@@ -261,6 +264,13 @@ class vLLMAsyncRollout(BaseRollout):
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 model.load_weights(weights)
+
+                # @zpqiu: NVFP4 needs =======================================================
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                model_config = model_runner.vllm_config.model_config
+                device = next(model.parameters()).device
+                process_weights_after_loading(model, model_config, device)
+                # @zpqiu: NVFP4 needs process_weights_after_loading end =====================
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

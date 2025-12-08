@@ -533,43 +533,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
             # @zpqiu: initialize =======================================================
             # only mlp weight is quantized, other layers are not quantized
-            _default_disabled_quantizer_cfg = {
-                "nn.BatchNorm1d": {"*": {"enable": False}},
-                "nn.BatchNorm2d": {"*": {"enable": False}},
-                "nn.BatchNorm3d": {"*": {"enable": False}},
-                "nn.LeakyReLU": {"*": {"enable": False}},
-                "*lm_head*": {"enable": False},
-                "*proj_out.*": {"enable": False},  # In Whisper model, lm_head has key name proj_out
-                "*block_sparse_moe.gate*": {"enable": False},  # Skip the MOE router
-                "*router*": {"enable": False},  # Skip the MOE router
-                "*mlp.gate.*": {"enable": False},  # Skip the MOE router
-                "*mlp.shared_expert_gate.*": {"enable": False},  # Skip the MOE router
-                "*linear_attn.conv1d*": {"enable": False},
-                "*mixer.conv1d*": {"enable": False},
-                "*output_layer*": {"enable": False},
-                "output.*": {"enable": False},
-                "default": {"enable": False},
-            }
-            weight_only_cfg = {
-                "quant_cfg": {
-                    "*weight_quantizer": {
-                        "num_bits": (2, 1),
-                        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-                        "axis": None,
-                        "enable": True,
-                    },
-                    "*input_quantizer": {
-                        "num_bits": (2, 1),
-                        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-                        "axis": None,
-                        "enable": False,
-                    },
-                    **_default_disabled_quantizer_cfg,
-                },
-                "algorithm": "max",
-            }
-            if self.config.actor.get("use_qat", False):
-                actor_module = mtq.quantize(actor_module, weight_only_cfg, None)
+            rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
+            from verl.utils.modelopt_utils import NVFP4_WEIGHT_ONLY_CFG
+            if rollout_config.quantization == "qat_nvfp4":
+                self._use_qat = True
+                actor_module = mtq.quantize(actor_module, NVFP4_WEIGHT_ONLY_CFG, None)
                 self.exporter = OnlineQuantExporter(actor_module)
             # @zpqiu: initialize =======================================================
             actor_module_fsdp = actor_module
@@ -626,10 +594,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        if rollout_config.model is not None and rollout_config.model.path is not None:
-            model_config = rollout_config.model
-        else:
-            model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+        self.model_config = model_config
 
         # 2. build rollout device mesh
         infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
@@ -814,7 +780,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 for idx in sorted(layers_groups.keys()):
                     yield from process_batch(layers_groups[idx])
 
-            if self.config.actor.get("use_qat", False):
+            if getattr(self, "_use_qat", False):
                 per_tensor_param = quantized_param_generator(params, self.exporter, device)
             else:
                 per_tensor_param = (
