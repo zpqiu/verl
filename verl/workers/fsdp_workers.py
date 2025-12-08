@@ -839,8 +839,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
-        if self.config.rollout.model is not None:
-            import_external_libs(self.config.rollout.model.get("external_lib", None))
 
         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
         use_remove_padding = self.config.model.get("use_remove_padding", False)
