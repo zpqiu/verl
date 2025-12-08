@@ -158,6 +158,40 @@ class RayDAPOTrainer(RayPPOTrainer):
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # @zpqiu: ======= DEBUG PRINTING ========
+                    # Print a random generated response after rollout
+                    if len(gen_batch_output) > 0:
+                        import random
+                        random_idx = random.randint(0, len(gen_batch_output) - 1)
+                        data_item = gen_batch_output[random_idx]
+                        
+                        # Extract prompt and response
+                        prompt_ids = data_item.batch["prompts"]
+                        response_ids = data_item.batch["responses"]
+                        
+                        # Get valid lengths using attention mask
+                        prompt_length = prompt_ids.shape[-1]
+                        valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+                        valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+                        
+                        # Extract valid IDs
+                        valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+                        valid_response_ids = response_ids[:valid_response_length]
+                        
+                        # Decode to text
+                        prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+                        response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+                        
+                        # Print the random sample
+                        print("\n" + "="*80)
+                        print(f"[Step {self.global_steps}] Random Rollout Sample (Index: {random_idx}/{len(gen_batch_output)-1})")
+                        print("="*80)
+                        print(f"PROMPT:\n{prompt_str}")
+                        print("-"*80)
+                        print(f"RESPONSE:\n{response_str[:800]}...")
+                        print("="*80 + "\n")
+                    # ======= DEBUG PRINTING END ========
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, "red"):
                             gen_baseline_batch = deepcopy(gen_batch)
