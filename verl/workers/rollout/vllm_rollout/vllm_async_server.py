@@ -43,7 +43,8 @@ from vllm.v1.executor.abstract import Executor
 
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
-from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
+from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
+from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
@@ -218,9 +219,8 @@ class vLLMHttpServerBase:
         )
         logger.info(f"override_generation_config: {override_generation_config}")
         quantization = self.config.quantization
-        use_block_quant = self.config.use_block_quant_rollout
-        if quantization:
-            if use_block_quant:
+        if quantization is not None:
+            if quantization == "fp8":
                 FP8_BLOCK_QUANT_KWARGS = {
                     "activation_scheme": "dynamic",
                     "fmt": "e4m3",
@@ -228,8 +228,11 @@ class vLLMHttpServerBase:
                     "weight_block_size": [128, 128],
                 }
                 fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-            apply_vllm_fp8_patches(block_quant=use_block_quant)
-        apply_vllm_modelopt_patches()
+                # Apply vllm fp8 patches
+                # Will remove the patch after vllm support on-the-fly quant for rollout natively.
+                apply_vllm_fp8_patches()
+            else:
+                raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
@@ -248,8 +251,8 @@ class vLLMHttpServerBase:
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "seed": self.config.get("seed", 0),
             "override_generation_config": json.dumps(override_generation_config),
-            "quantization": "fp8" if quantization else None,
-            "hf_overrides": {"quantization_config": fp8_block_quant_kwargs} if quantization and use_block_quant else None,
+            "quantization": quantization,
+            "hf_overrides": {"quantization_config": fp8_block_quant_kwargs} if quantization == "fp8" else None,
             **engine_kwargs,
         }
 
@@ -292,6 +295,9 @@ class vLLMHttpServerBase:
                     "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
                 }
             )
+
+        if self.config.enable_rollout_routing_replay:
+            args.update({"enable_return_routed_experts": True})
 
         server_args = ["serve", self.model_config.local_path]
         for k, v in args.items():
@@ -429,7 +435,12 @@ class vLLMHttpServerBase:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+
+        routed_experts = None
+        if self.config.enable_rollout_routing_replay:
+            routed_experts = final_res.outputs[0].routed_experts
+
+        return TokenOutput(token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts)
 
     async def wake_up(self):
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -454,6 +465,10 @@ class vLLMHttpServerBase:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def clear_kv_cache(self):
+        if self.node_rank == 0:
+            await self.engine.reset_prefix_cache()
+
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
@@ -468,7 +483,7 @@ class vLLMHttpServer(vLLMHttpServerBase):
 
     def __init__(
         self,
-        config: RolloutConfig | RewardModelConfig,
+        config: RolloutConfig,
         model_config: HFModelConfig,
         rollout_mode: RolloutMode,
         workers: list[ActorHandle],
@@ -487,7 +502,7 @@ class vLLMReplica(RolloutReplica):
     def __init__(
         self,
         replica_rank: int,
-        config: RolloutConfig | RewardModelConfig,
+        config: RolloutConfig,
         model_config: HFModelConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
