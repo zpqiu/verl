@@ -194,7 +194,7 @@ class vLLMAsyncRollout(BaseRollout):
                 # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
-            elif self.config.quantization == "qat_nvfp4":
+            elif self.config.quantization == "qat_nvfp4" or self.config.quantization == "qat_nvfp4_mlp_only":
                 from verl.utils.modelopt_utils import apply_vllm_modelopt_patches
                 apply_vllm_modelopt_patches()
             else:

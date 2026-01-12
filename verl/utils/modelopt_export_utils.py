@@ -261,6 +261,7 @@ class OnlineQuantExporter:
 
         # 第一遍：收集所有权重、quantizer 的 amax 值和 pre_quant_scale
         weight_cache = {}  # module_name -> weight tensor (克隆，用于 resmooth)
+        # weight_amax_cache = {}  # module_name -> weight amax
         input_amax_cache = {}  # module_name -> input_quantizer amax
         pre_quant_scale_cache = {}  # module_name -> pre_quant_scale
 
@@ -272,6 +273,9 @@ class OnlineQuantExporter:
                 if module_name in self.quant_layer_configs:
                     # 克隆权重，因为后面可能需要 resmooth
                     weight_cache[module_name] = value.clone().to(self.dtype)
+            # elif "weight_quantizer._amax" in clean_key:
+                # module_name = clean_key.replace(".weight_quantizer._amax", "")
+                # weight_amax_cache[module_name] = value.clone()
             elif "input_quantizer._amax" in clean_key:
                 module_name = clean_key.replace(".input_quantizer._amax", "")
                 input_amax_cache[module_name] = value.clone()
@@ -491,3 +495,79 @@ class OnlineQuantExporter:
             "group_size": first_config["block_size"],
             "quantized_layers": list(self.quant_layer_configs.keys()),
         }
+
+    def unify_fused_layer_amax(self):
+        input_amax_cache = {}  # module_name -> input_quantizer amax
+        pre_quant_scale_cache = {}  # module_name -> pre_quant_scale
+        weight_amax_cache = {}  # module_name -> weight amax
+
+        for name, module in self.model.named_modules():
+            quant_format = get_quantization_format(module)
+            if quant_format in [QUANTIZATION_NONE, None]:
+                continue
+            if quant_format not in self.SUPPORTED_FORMATS:
+                continue
+
+            weight_quantizer = getattr(module, "weight_quantizer", None)
+            if weight_quantizer is None:
+                continue
+            weight_amax_cache[name] = weight_quantizer.amax
+
+            input_quantizer = getattr(module, "input_quantizer", None)
+            if input_quantizer is None:
+                continue
+
+            if input_quantizer.amax is not None:
+                input_amax_cache[name] = input_quantizer.amax
+            if input_quantizer.pre_quant_scale is not None:
+                pre_quant_scale_cache[name] = input_quantizer.pre_quant_scale
+
+        # 第二遍：对 fused layers 处理 pre_quant_scale 和 resmooth 权重
+        # 完全对应 preprocess_linear_fusion 的逻辑：
+        # 1. 统一 pre_quant_scale 为平均值
+        # 2. Resmooth 权重：weight = weight * old_scale / avg_scale
+        # 3. 重新计算 weight amax（因为权重被缩放了）
+        # 4. 统一 input amax（取 max）
+        # 5. 统一 weight amax（仅对标量 amax，取 max）
+        #
+        unified_weight_amax = {}  # module_name -> unified weight amax
+
+        # 处理已记录的 fused layer groups
+        processed_groups = set()
+        for module_name in self.quant_layer_configs:
+            if module_name in self.fused_layer_to_group:
+                group = self.fused_layer_to_group[module_name]
+                group_key = tuple(sorted(group))
+
+                if group_key in processed_groups:
+                    continue
+                processed_groups.add(group_key)
+
+                # 根据 resmooth 后的权重重新计算 weight amax
+                group_weight_amaxs = []
+                for layer_name in group:
+                    if layer_name in weight_amax_cache:
+                        amax = weight_amax_cache[layer_name]
+                        # 只对标量 amax 进行统一
+                        if amax.numel() == 1:
+                            group_weight_amaxs.append(amax)
+
+                # 统一 weight amax（取 max）
+                if group_weight_amaxs:
+                    unified_amax = torch.max(torch.stack(group_weight_amaxs))
+                    for layer_name in group:
+                        unified_weight_amax[layer_name] = unified_amax
+
+        for name, module in self.model.named_modules():
+            quant_format = get_quantization_format(module)
+            if quant_format in [QUANTIZATION_NONE, None]:
+                continue
+            if quant_format not in self.SUPPORTED_FORMATS:
+                continue
+
+            weight_quantizer = getattr(module, "weight_quantizer", None)
+            if weight_quantizer is None:
+                continue
+            
+            if name in unified_weight_amax:
+                weight_quantizer.amax = unified_weight_amax[name]

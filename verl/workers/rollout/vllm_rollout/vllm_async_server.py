@@ -16,6 +16,8 @@ import asyncio
 import json
 import logging
 import os
+import threading
+from concurrent.futures import Future
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -35,7 +37,15 @@ from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+# Catch import error and import from different path
+try:
+    from vllm.utils import get_tcp_uri
+except ImportError:
+    from vllm.utils.network_utils import get_tcp_uri
+try:
+    from vllm.utils import FlexibleArgumentParser
+except ImportError:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -49,7 +59,7 @@ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutpu
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 from verl.utils.fp8_utils import apply_vllm_fp8_patches
-from verl.utils.modelopt_utils import apply_vllm_modelopt_patches, HF_NVFP4_WEIGHT_ONLY_CFG
+from verl.utils.modelopt_utils import apply_vllm_modelopt_patches, HF_NVFP4_WEIGHT_ONLY_CFG, HF_NVFP4_MLP_WEIGHT_ONLY_CFG
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -98,6 +108,7 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
+        non_block: bool = False,
         **kwargs_extra: Any,
     ) -> list[Any]:
         if isinstance(method, str):
@@ -110,14 +121,39 @@ class ExternalZeroMQDistributedExecutor(Executor):
         for socket in self.sockets:
             socket.send(message, zmq.DONTWAIT)
 
-        outputs = []
-        for socket in self.sockets:
-            outputs.append(pickle.loads(socket.recv()))
+        if non_block:
+            # For async execution, return Future objects
+            futures = []
+            for socket in self.sockets:
+                future = Future()
+                
+                def _recv_async(sock, fut):
+                    try:
+                        output = pickle.loads(sock.recv())
+                        if isinstance(output, Exception):
+                            fut.set_exception(output)
+                        else:
+                            fut.set_result(output)
+                    except Exception as e:
+                        fut.set_exception(e)
+                
+                # Start a thread to receive the result asynchronously
+                thread = threading.Thread(target=_recv_async, args=(socket, future))
+                thread.daemon = True
+                thread.start()
+                futures.append(future)
 
-        for output in outputs:
-            if isinstance(output, Exception):
-                raise output
-        return outputs
+            return futures
+        else:
+            # Blocking execution - maintain backward compatibility with vllm 0.11.0
+            outputs = []
+            for socket in self.sockets:
+                outputs.append(pickle.loads(socket.recv()))
+
+            for output in outputs:
+                if isinstance(output, Exception):
+                    raise output
+            return outputs
 
     def check_health(self):
         return
@@ -234,6 +270,9 @@ class vLLMHttpServerBase:
                 apply_vllm_fp8_patches()
             elif quantization == "qat_nvfp4":
                 quantization_config = HF_NVFP4_WEIGHT_ONLY_CFG
+                apply_vllm_modelopt_patches()
+            elif quantization == "qat_nvfp4_mlp_only":
+                quantization_config = HF_NVFP4_MLP_WEIGHT_ONLY_CFG
                 apply_vllm_modelopt_patches()
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
@@ -364,7 +403,12 @@ class vLLMHttpServerBase:
         await engine_client.reset_mm_cache()
 
         app = build_app(args)
-        await init_app_state(engine_client, vllm_config, app.state, args)
+        # if vllm version is 0.11.1 or higher, call init_app_state with 3 parameters
+        import vllm
+        if vllm.__version__ >= "0.11.1":
+            await init_app_state(engine_client, app.state, args)
+        else:
+            await init_app_state(engine_client, vllm_config, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 

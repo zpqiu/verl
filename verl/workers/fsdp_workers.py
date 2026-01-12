@@ -534,11 +534,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # @zpqiu: initialize =======================================================
             # only mlp weight is quantized, other layers are not quantized
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-            from verl.utils.modelopt_utils import NVFP4_WEIGHT_ONLY_CFG
-            if rollout_config.quantization == "qat_nvfp4":
+            from verl.utils.modelopt_utils import NVFP4_WEIGHT_ONLY_CFG, NVFP4_MLP_WEIGHT_ONLY_CFG
+            if rollout_config.quantization.startswith("qat"):
                 self._use_qat = True
-                actor_module = mtq.quantize(actor_module, NVFP4_WEIGHT_ONLY_CFG, None)
+                if rollout_config.quantization == "qat_nvfp4_mlp_only":
+                    actor_module = mtq.quantize(actor_module, NVFP4_MLP_WEIGHT_ONLY_CFG, None)
+                else:
+                    actor_module = mtq.quantize(actor_module, NVFP4_WEIGHT_ONLY_CFG, None)
+                if self.rank == 0:
+                    print(f"actor_module: {actor_module}")
                 self.exporter = OnlineQuantExporter(actor_module)
+                self.exporter.unify_fused_layer_amax()
+                # from verl.utils.modelopt_export_utils2 import requantize_resmooth_fused_llm_layers
+                # requantize_resmooth_fused_llm_layers(actor_module)
+                if self.rank == 0:
+                    print(f" =======================DEBUG: unify_fused_layer_amax ==========================")
+                    for name, module in actor_module.named_modules():
+                        if name in ["model.layers.35.mlp.gate_proj", "model.layers.35.mlp.up_proj"]:
+                            print(f"@@@@RANK 0: {name}, {module.weight_quantizer.amax}, {module.weight_quantizer.amax.dtype}")
+                    # print(f"actor_module: {actor_module}")
+                if self.rank == 1:
+                    print(f" =======================DEBUG: RANK 1 ==========================")
+                    for name, module in actor_module.named_modules():
+                        if name in ["model.layers.35.mlp.gate_proj", "model.layers.35.mlp.up_proj"]:
+                            print(f"@@@@RANK 1: {name}, {module.weight_quantizer.amax}, {module.weight_quantizer.amax.dtype}")
             # @zpqiu: initialize =======================================================
             actor_module_fsdp = actor_module
         else:
@@ -684,6 +703,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
+            # @zpqiu: custom exporterv2 =======================================================
+            # from verl.utils.modelopt_export_utils2 import export_hf_checkpoint
+            # params = export_hf_checkpoint(self.actor_module_fsdp, dtype=torch.bfloat16)
+            # if self.rank <= 1:
+            #     print(f" =======================DEBUG: params ==========================")
+                # for name, param in params.items():
+                #     if "layers.35" in name:
+                #         if len(param.shape) == 2 and param.shape[0] > 14200:
+                #             sample_data = param[14190, :4]
+                #         elif len(param.shape) == 2:
+                #             sample_data = param[128, :4]
+                #         elif len(param.shape) == 1:
+                #             sample_data = param[:4]
+                #         else:
+                #             sample_data = param
+                #         print(f"@@@@RANK {self.rank}: {name}, {sample_data} {param.dtype}, {isinstance(param, DTensor)}")
+            # @zpqiu: custom exporterv2 end =======================================================
+
             # include raw modelopt quantizer params
             params = self.actor_module_fsdp.state_dict()
 
@@ -762,7 +799,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             sample_data = v[128, :4]
                         elif len(v.shape) == 1:
                             sample_data = v[:4]
-                        print(f"DEBUG SYNC: {k}, {sample_data} {v.shape}, {type(v)}")
+                        print(f"DEBUG SYNC: {k}, {sample_data} {v.shape}, {v.dtype}")
                         # @zpqiu: DEBUG PRINTING end =======================================================
                         yield k, v
                     
@@ -780,8 +817,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 for idx in sorted(layers_groups.keys()):
                     yield from process_batch(layers_groups[idx])
 
+            def simple_generator(params, exporter, device):
+                for name, param in params.items():
+                    raw_state_dict = {
+                        name: (param.to(device, non_blocking=True).full_tensor() 
+                               if isinstance(param, DTensor) else param)
+                    }
+                    quantized_dict = exporter.export(raw_state_dict)
+                    for k, v in quantized_dict.items():
+                        sample_data = v
+                        if len(v.shape) == 2 and v.shape[0] > 14200:
+                            sample_data = v[14190, :4]
+                        elif len(v.shape) == 2:
+                            sample_data = v[128, :4]
+                        elif len(v.shape) == 1:
+                            sample_data = v[:4]
+                        print(f"DEBUG SYNC: {k}, {sample_data} {v.shape}, {v.dtype}")
+                        yield k, v
             if getattr(self, "_use_qat", False):
                 per_tensor_param = quantized_param_generator(params, self.exporter, device)
+                # per_tensor_param = simple_generator(params, self.exporter, device)
             else:
                 per_tensor_param = (
                     (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
@@ -789,6 +844,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 )
             # @zpqiu: custom exporter end =======================================================
 
+            # per_tensor_param = (
+            #     (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+            #     for name, param in params.items()
+            # )
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
@@ -955,6 +1014,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+
+            for name, module in self.actor_module_fsdp.named_modules():
+                if hasattr(module, "weight_quantizer"):
+                    module.weight_quantizer.reset_amax()
+            from modelopt.torch.quantization.model_calib import max_calibrate
+            max_calibrate(self.actor_module_fsdp)
+            self.exporter.unify_fused_layer_amax()
+            # from verl.utils.modelopt_export_utils2 import requantize_resmooth_fused_llm_layers
+            # requantize_resmooth_fused_llm_layers(actor_module)
+            if self.rank == 0:
+                print(f" =======================DEBUG: unify_fused_layer_amax ==========================")
+                for name, module in self.actor_module_fsdp.named_modules():
+                    if name in ["model.layers.35.mlp.gate_proj", "model.layers.35.mlp.up_proj"]:
+                        print(f"@@@@RANK 0: {name}, {module.weight_quantizer.amax}, {module.weight_quantizer.amax.dtype}")
+                # print(f"actor_module: {actor_module}")
+            if self.rank == 1:
+                print(f" =======================DEBUG: RANK 1 ==========================")
+                for name, module in self.actor_module_fsdp.named_modules():
+                    if name in ["model.layers.35.mlp.gate_proj", "model.layers.35.mlp.up_proj"]:
+                        print(f"@@@@RANK 1: {name}, {module.weight_quantizer.amax}, {module.weight_quantizer.amax.dtype}")
+            # @zpqiu: initialize =======================================================
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
