@@ -169,13 +169,15 @@ def gptmodel_forward_no_padding(
     pad_token_id=None,
     data_format: str = "thd",
     enable_mtp: bool = False,
-    use_fp8_padding: bool = False,
 ):
     """Default forward pass for GPT models with optional sequence packing."""
 
     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
     pre_process = unwrap_model(model).pre_process
     post_process = unwrap_model(model).post_process
+
+    fp8 = unwrap_model(model).config.fp8
+    use_fp8_padding = fp8 in ["e4m3", "hybrid"]
 
     model_kwargs = {}
     if "pixel_values" in multi_modal_inputs:

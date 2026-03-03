@@ -146,10 +146,12 @@ def fused_forward_no_padding_gen(vision_model: bool = False):
         temperature: float,
         calculate_entropy: bool,
         pad_token_id: int,
-        use_fp8_padding: bool = False,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+
+        fp8 = unwrap_model(model).config.fp8
+        use_fp8_padding = fp8 in ["e4m3", "hybrid"]
 
         input_ids_rmpad, packed_seq_params = preprocess_thd_no_padding(
             input_ids, pre_process=pre_process, use_fp8_padding=use_fp8_padding
